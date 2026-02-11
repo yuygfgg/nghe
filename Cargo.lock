@@ -2637,7 +2637,7 @@ checksum = "60993920e071b0c9b66f14e2b32740a4e27ffc82854dcd72035887f336a09a28"
 
 [[package]]
 name = "nghe_api"
-version = "0.10.10"
+version = "0.10.12"
 dependencies = [
  "bon",
  "built",
@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "nghe_backend"
-version = "0.10.10"
+version = "0.10.12"
 dependencies = [
  "alrc",
  "async-walkdir",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "nghe_frontend"
-version = "0.10.10"
+version = "0.10.12"
 dependencies = [
  "codee",
  "concat-string",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "nghe_proc_macro"
-version = "0.10.10"
+version = "0.10.12"
 dependencies = [
  "bon",
  "concat-string",
@@ -4826,9 +4826,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3015e6ce46d5ad8751e4a772543a30c7511468070e98e64e20165f8f81155b64"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
