@@ -261,11 +261,9 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         let cue_relative_path = flac_relative_path.to_path_buf().with_extension("cue");
 
         let base_album = &base_information.metadata.album;
-        let album_name =
-            cue_sheet.title.as_deref().unwrap_or_else(|| base_album.name.as_ref()).to_owned();
+        let album_name = cue_sheet.title().unwrap_or(base_album.name.as_ref()).to_owned();
         let album_date = cue_sheet
-            .date
-            .as_deref()
+            .date()
             .and_then(|s| s.parse::<audio::Date>().ok())
             .unwrap_or(base_album.date);
 
@@ -276,8 +274,10 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
             .first()
             .map(|a| a.name.as_ref())
             .unwrap_or("Unknown Artist");
-        let album_artist_name =
-            cue_sheet.performer.as_deref().unwrap_or(album_artist_fallback).to_owned();
+        let album_artist_name = cue_sheet
+            .performer()
+            .unwrap_or(album_artist_fallback)
+            .to_owned();
 
         // Upsert album once; track songs will reference it.
         let album_id = audio::Album {
@@ -312,26 +312,32 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         let base_file_size = base_information.file.size.get();
         let base_property = base_information.property;
 
-        let cue_file = cue_sheet.files.get(0).ok_or_else(|| error::Kind::NotFound)?;
-        let track_total: Option<u16> = cue_file.tracks.len().try_into().ok();
+        let file_id = cue_rw::FileID::from(0usize);
+        let cue_track_ids = cue_sheet
+            .cue()
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, (fid, _))| *fid == file_id)
+            .map(|(track_id, _)| track_id)
+            .collect::<Vec<_>>();
+        let track_total: Option<u16> = cue_track_ids.len().try_into().ok();
 
         let mut first_song_id: Option<Uuid> = None;
 
-        for (i, track) in cue_file.tracks.iter().enumerate() {
-            let Some(start_seconds) = track.index01.map(cue::CueTime::as_seconds_f64) else {
-                continue;
-            };
+        for (i, &track_id) in cue_track_ids.iter().enumerate() {
+            let Ok(track_number) = u16::try_from(i + 1) else { break };
+
+            let Some(span) = cue_sheet.resolve_track_span(track_number) else { continue };
+            let start_seconds = span.start_seconds;
             if start_seconds >= total_duration_s {
                 continue;
             }
 
-            let next_start_seconds = cue_file
-                .tracks
-                .iter()
-                .skip(i + 1)
-                .find_map(|t| t.index01.map(cue::CueTime::as_seconds_f64));
-            let duration_seconds = next_start_seconds.unwrap_or(total_duration_s) - start_seconds;
-            let duration_seconds = duration_seconds.max(0.0);
+            let duration_seconds = span
+                .duration_seconds
+                .unwrap_or(total_duration_s - start_seconds)
+                .max(0.0);
 
             if duration_seconds == 0.0 {
                 continue;
@@ -339,7 +345,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
 
             let track_relative_path = cue::build_virtual_track_relative_path(
                 cue_relative_path.to_path(),
-                track.number,
+                track_number,
                 audio::Format::Flac,
             )?;
             let track_relative_path = track_relative_path.to_string();
@@ -363,12 +369,18 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                 base_file_size
             };
 
-            let title = track
-                .title
+            let track = &cue_sheet.cue().tracks[track_id].1;
+
+            let title = match track.title.trim() {
+                "" => format!("Track {track_number:02}"),
+                t => t.to_owned(),
+            };
+            let song_artist_name = track
+                .performer
                 .as_deref()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("Track {:02}", track.number));
-            let song_artist_name = track.artist.as_deref().unwrap_or(&album_artist_name).to_owned();
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&album_artist_name)
+                .to_owned();
 
             let artists = audio::Artists::new(
                 [audio::Artist { name: Cow::Owned(song_artist_name), mbz_id: None }],
@@ -386,9 +398,9 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                             original_release_date: audio::Date::default(),
                             mbz_id: None,
                         },
-                        track_disc: audio::TrackDisc {
-                            track: audio::position::Position {
-                                number: Some(track.number),
+                            track_disc: audio::TrackDisc {
+                                track: audio::position::Position {
+                                number: Some(track_number),
                                 total: track_total,
                             },
                             disc: base_disc,
@@ -474,10 +486,12 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                         match cue::CueSheet::parse(&bytes) {
                             Ok(sheet) => {
                                 let audio_file_name = entry.path.file_name().unwrap_or_default();
+                                let file_id = cue_rw::FileID::from(0usize);
                                 let has_track_index = sheet
-                                    .files
-                                    .get(0)
-                                    .is_some_and(|f| f.tracks.iter().any(|t| t.index01.is_some()));
+                                    .cue()
+                                    .tracks
+                                    .iter()
+                                    .any(|(fid, t)| *fid == file_id && t.indices.iter().any(|(id, _)| *id == 1));
                                 if has_track_index
                                     && sheet.is_single_file()
                                     && sheet.file_name_matches(audio_file_name)

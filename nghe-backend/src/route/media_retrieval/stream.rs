@@ -35,40 +35,14 @@ pub async fn handler(
     let format = match request.format.unwrap_or_default() {
         Format::Raw => {
             if let Some(virtual_track) = virtual_track {
-                // TODO: Range requests on virtual tracks are not supported for now.
-                let _ = range;
-
-                let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
-                let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
-
-                let span = cue_sheet
-                    .resolve_track_span(virtual_track.track_number)
-                    .ok_or_else(|| error::Kind::NotFound)?;
-                let audio_path = cue_sheet
-                    .resolve_audio_file_path(virtual_track.cue_path.to_path())
-                    .ok_or_else(|| error::Kind::NotFound)?;
-
-                let offset = time_offset as f64;
-                let trim = transcode::Trim {
-                    start: span.start_seconds + offset,
-                    duration: span.duration_seconds.map(|d| (d - offset).max(0.0)),
-                };
-
-                let input = filesystem.transcode_input(audio_path.to_path()).await?;
-                let (rx, _handle) = transcode::Transcoder::spawn(
+                return cue::virtual_flac_track_response(
+                    &filesystem,
                     &config,
-                    transcode::Path { input, output: None },
-                    nghe_api::common::format::Transcode::Flac,
-                    320,
-                    trim,
-                );
-
-                return binary::Response::from_rx(
-                    rx,
-                    nghe_api::common::format::Transcode::Flac,
-                    #[cfg(test)]
-                    None::<BinaryStatus>,
-                );
+                    &source.property,
+                    &virtual_track,
+                    range,
+                )
+                .await;
             }
 
             let size_offset =

@@ -6,6 +6,7 @@
 #![feature(if_let_guard)]
 #![feature(iterator_try_collect)]
 #![feature(proc_macro_hygiene)]
+#![feature(seek_stream_len)]
 #![feature(specialization)]
 #![feature(stmt_expr_attributes)]
 #![feature(str_as_str)]
@@ -16,12 +17,14 @@ pub mod config;
 mod constant;
 mod cue;
 mod database;
+mod flac;
 #[coverage(off)]
 mod error;
 mod file;
 mod filesystem;
 mod http;
 mod integration;
+mod libflac_wrapper;
 pub mod migration;
 mod orm;
 mod route;
@@ -29,6 +32,7 @@ mod scan;
 mod schema;
 mod sync;
 mod time;
+mod utils;
 
 #[cfg(test)]
 #[coverage(off)]

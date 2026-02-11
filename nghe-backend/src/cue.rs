@@ -1,10 +1,14 @@
 use std::borrow::Cow;
 
+use cue_rw::{CUEFile, FileID};
 use encoding_rs as enc;
 use nghe_api::common::format::Trait as _;
+use num_rational::Rational32;
 use typed_path::{Utf8TypedPath, Utf8TypedPathBuf};
 
 use crate::{Error, file};
+
+mod flac_split;
 
 /// Marker directory suffix for "virtual files" derived from a `.cue` sheet.
 ///
@@ -12,64 +16,23 @@ use crate::{Error, file};
 /// `Album.cue.__nghe_cue__/01.flac`
 pub const VIRTUAL_DIR_SUFFIX: &str = ".__nghe_cue__";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CueTime {
-    pub minutes: u32,
-    pub seconds: u32,
-    pub frames: u32,
-}
-
-impl CueTime {
-    /// CUE time uses 75 frames per second.
-    pub fn as_seconds_f64(self) -> f64 {
-        (self.minutes as f64) * 60.0 + (self.seconds as f64) + (self.frames as f64) / 75.0
-    }
-
-    fn parse(input: &str) -> Option<Self> {
-        let mut it = input.split(':');
-        let minutes: u32 = it.next()?.trim().parse().ok()?;
-        let seconds: u32 = it.next()?.trim().parse().ok()?;
-        let frames: u32 = it.next()?.trim().parse().ok()?;
-        Some(Self { minutes, seconds, frames })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CueTrack {
-    pub number: u16,
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub isrc: Option<String>,
-    pub index01: Option<CueTime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CueFile {
-    pub name: String,
-    pub kind: Option<String>,
-    pub tracks: Vec<CueTrack>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CueSheet {
-    pub title: Option<String>,
-    pub performer: Option<String>,
-    pub catalog: Option<String>,
-    pub date: Option<String>,
-    pub files: Vec<CueFile>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CueTrackSpan {
     pub start_seconds: f64,
     pub duration_seconds: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CueSheet {
+    cue:  CUEFile,
+    date: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualCueTrack {
     /// Absolute path to the `.cue` file on the configured filesystem.
     pub cue_path: Utf8TypedPathBuf,
-    /// CUE `TRACK NN` number.
+    /// Virtual `NN` number (1-based) used by `build_virtual_track_relative_path`.
     pub track_number: u16,
 }
 
@@ -97,48 +60,74 @@ fn parse_track_file_number(file_name: &str) -> Option<u16> {
     stem.parse().ok()
 }
 
-fn first_token_and_rest(line: &str) -> (&str, &str) {
-    let line = line.trim();
-    if line.is_empty() {
-        return ("", "");
+fn non_empty(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn cue_timestamp_seconds(ts: cue_rw::CUETimeStamp) -> f64 {
+    let seconds = Rational32::from(ts);
+    f64::from(*seconds.numer()) / f64::from(*seconds.denom())
+}
+
+fn strip_surrounding_quotes(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
+}
+
+fn split_word_rest(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    let mut split_at = None;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            split_at = Some(idx);
+            break;
+        }
     }
 
-    let split_at =
-        line.char_indices().find(|(_, c)| c.is_whitespace()).map(|(i, _)| i).unwrap_or(line.len());
-    let (head, tail) = line.split_at(split_at);
-    (head, tail.trim())
-}
-
-fn parse_quoted_or_rest(input: &str) -> (String, &str) {
-    let input = input.trim();
-    if let Some(rest) = input.strip_prefix('"')
-        && let Some(end) = rest.find('"')
-    {
-        let (value, rest) = rest.split_at(end);
-        (value.to_owned(), rest[1..].trim())
-    } else {
-        (input.to_owned(), "")
+    match split_at {
+        Some(idx) => (&s[..idx], s[idx..].trim()),
+        None => (s, ""),
     }
 }
 
-fn parse_file_directive(rest: &str) -> (String, Option<String>) {
-    let (name, rest) = parse_quoted_or_rest(rest);
-    let kind = first_token_and_rest(rest).0;
-    let kind = if kind.is_empty() { None } else { Some(kind.to_owned()) };
-    (name, kind)
-}
+fn parse_rem_date(comments: &[String]) -> Option<String> {
+    comments.iter().find_map(|line| {
+        // Be tolerant of different casing / spacing.
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
 
-fn parse_track_directive(rest: &str) -> Option<u16> {
-    let (num, _rest) = first_token_and_rest(rest);
-    num.parse().ok()
-}
+        // `cue-rw` stores the remainder of `REM ...` lines (without the leading `REM`),
+        // so `REM DATE 2001` becomes `DATE 2001` in `CUEFile.comments`.
+        //
+        // Still, accept both formats in case another parser changes this.
+        let (tag, rest) = split_word_rest(line);
+        if tag.eq_ignore_ascii_case("DATE") {
+            return non_empty(strip_surrounding_quotes(rest)).map(str::to_owned);
+        }
 
-fn parse_index_directive(rest: &str) -> Option<(u8, CueTime)> {
-    let (id_str, rest) = first_token_and_rest(rest);
-    let (time_str, _rest) = first_token_and_rest(rest);
-    let id: u8 = id_str.parse().ok()?;
-    let time = CueTime::parse(time_str)?;
-    Some((id, time))
+        if tag.eq_ignore_ascii_case("REM") {
+            let (subtag, subrest) = split_word_rest(rest);
+            if subtag.eq_ignore_ascii_case("DATE") {
+                return non_empty(strip_surrounding_quotes(subrest)).map(str::to_owned);
+            }
+        }
+
+        // Also tolerate `DATE=...` / `REM DATE=...` formats.
+        let upper = line.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("DATE=") {
+            let rest = line.get(line.len() - rest.len()..).unwrap_or("");
+            return non_empty(strip_surrounding_quotes(rest)).map(str::to_owned);
+        }
+        if let Some(rest) = upper.strip_prefix("REM DATE=") {
+            let rest = line.get(line.len() - rest.len()..).unwrap_or("");
+            return non_empty(strip_surrounding_quotes(rest)).map(str::to_owned);
+        }
+
+        None
+    })
 }
 
 pub fn decode_cue(bytes: &[u8]) -> Result<Cow<'_, str>, Error> {
@@ -163,127 +152,57 @@ impl CueSheet {
     }
 
     pub fn parse_str(input: &str) -> Result<Self, Error> {
-        let mut sheet =
-            Self { title: None, performer: None, catalog: None, date: None, files: vec![] };
+        // Be tolerant of surrounding whitespace; some cue sheets have leading/trailing blank lines.
+        let cue = CUEFile::try_from(input.trim())?;
+        let date = parse_rem_date(&cue.comments);
+        Ok(Self { cue, date })
+    }
 
-        let mut current_file: Option<usize> = None;
-        let mut current_track: Option<usize> = None;
+    pub fn cue(&self) -> &CUEFile {
+        &self.cue
+    }
 
-        for raw in input.lines() {
-            let line = raw.trim();
-            if line.is_empty() {
-                continue;
-            }
+    pub fn title(&self) -> Option<&str> {
+        non_empty(&self.cue.title)
+    }
 
-            let (cmd, rest) = first_token_and_rest(line);
-            if cmd.is_empty() {
-                continue;
-            }
+    pub fn performer(&self) -> Option<&str> {
+        non_empty(&self.cue.performer)
+    }
 
-            if cmd.eq_ignore_ascii_case("REM") {
-                let (rem_key, rem_rest) = first_token_and_rest(rest);
-                if rem_key.eq_ignore_ascii_case("DATE") && sheet.date.is_none() {
-                    let (value, _rest) = parse_quoted_or_rest(rem_rest);
-                    if !value.is_empty() {
-                        sheet.date = Some(value);
-                    }
-                }
-                continue;
-            }
+    pub fn catalog(&self) -> Option<&str> {
+        self.cue.catalog.as_deref().and_then(non_empty)
+    }
 
-            if cmd.eq_ignore_ascii_case("FILE") {
-                let (name, kind) = parse_file_directive(rest);
-                sheet.files.push(CueFile { name, kind, tracks: vec![] });
-                current_file = Some(sheet.files.len() - 1);
-                current_track = None;
-                continue;
-            }
-
-            if cmd.eq_ignore_ascii_case("TRACK") {
-                let Some(file_id) = current_file else { continue };
-                let Some(number) = parse_track_directive(rest) else { continue };
-                sheet.files[file_id].tracks.push(CueTrack {
-                    number,
-                    title: None,
-                    artist: None,
-                    isrc: None,
-                    index01: None,
-                });
-                current_track = Some(sheet.files[file_id].tracks.len() - 1);
-                continue;
-            }
-
-            // The rest are key/value directives with track-level overrides.
-            let target_track = current_file.zip(current_track).and_then(|(file_id, track_id)| {
-                sheet.files.get_mut(file_id)?.tracks.get_mut(track_id)
-            });
-
-            if cmd.eq_ignore_ascii_case("TITLE") {
-                let (value, _rest) = parse_quoted_or_rest(rest);
-                if let Some(track) = target_track {
-                    track.title = Some(value);
-                } else {
-                    sheet.title = Some(value);
-                }
-                continue;
-            }
-
-            if cmd.eq_ignore_ascii_case("PERFORMER") {
-                let (value, _rest) = parse_quoted_or_rest(rest);
-                if let Some(track) = target_track {
-                    track.artist = Some(value);
-                } else {
-                    sheet.performer = Some(value);
-                }
-                continue;
-            }
-
-            if cmd.eq_ignore_ascii_case("CATALOG") {
-                let (value, _rest) = parse_quoted_or_rest(rest);
-                sheet.catalog = Some(value);
-                continue;
-            }
-
-            if cmd.eq_ignore_ascii_case("ISRC") {
-                let (value, _rest) = parse_quoted_or_rest(rest);
-                if let Some(track) = target_track {
-                    track.isrc = Some(value);
-                }
-                continue;
-            }
-
-            if cmd.eq_ignore_ascii_case("INDEX") {
-                let Some(track) = target_track else { continue };
-                let Some((id, time)) = parse_index_directive(rest) else { continue };
-                if id == 1 {
-                    track.index01 = Some(time);
-                }
-                continue;
-            }
-        }
-
-        Ok(sheet)
+    pub fn date(&self) -> Option<&str> {
+        self.date.as_deref().and_then(non_empty)
     }
 
     pub fn is_single_file(&self) -> bool {
-        self.files.len() == 1
+        self.cue.files.len() == 1
     }
 
     pub fn file_name_matches(&self, audio_file_name: &str) -> bool {
-        let Some(file) = self.files.first() else { return false };
+        let Some(file) = self.cue.files.first() else { return false };
         // CUE's FILE may include a relative path. Only compare the basename.
-        let cue_file_basename = file.name.rsplit(['/', '\\']).next().unwrap_or(file.name.as_str());
+        let cue_file_basename = file.rsplit(['/', '\\']).next().unwrap_or(file.as_str());
         cue_file_basename.eq_ignore_ascii_case(audio_file_name)
     }
 
     pub fn resolve_track_span(&self, track_number: u16) -> Option<CueTrackSpan> {
-        let file = self.files.first()?;
+        let file_id = FileID::from(0usize);
 
-        let mut tracks = file
-            .tracks
-            .iter()
-            .filter_map(|t| Some((t.number, t.index01?.as_seconds_f64())))
-            .collect::<Vec<_>>();
+        // Map virtual `NN` to the Nth track (in-file) with `INDEX 01`.
+        let mut tracks: Vec<(u16, f64)> = vec![];
+        let mut number: u16 = 0;
+        for (_fid, t) in self.cue.tracks.iter().filter(|(fid, _)| *fid == file_id) {
+            number = number.saturating_add(1);
+            let Some((_, ts)) = t.indices.iter().find(|(id, _)| *id == 1) else {
+                continue;
+            };
+            tracks.push((number, cue_timestamp_seconds(*ts)));
+        }
+
         tracks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let idx = tracks.iter().position(|(n, _)| *n == track_number)?;
@@ -296,12 +215,24 @@ impl CueSheet {
         &self,
         cue_path: Utf8TypedPath<'a>,
     ) -> Option<Utf8TypedPathBuf> {
-        let file = self.files.first()?;
+        let file = self.cue.files.first()?;
         let parent = cue_path.parent()?;
         // Be tolerant of Windows-style separators inside the CUE sheet.
-        let name = file.name.replace('\\', "/");
+        let name = file.replace('\\', "/");
         Some(parent.join(&name))
     }
+}
+
+pub(crate) async fn virtual_flac_track_response(
+    filesystem: &crate::filesystem::Impl<'_>,
+    config: &crate::config::Transcode,
+    cache_key: &crate::file::Property<crate::file::audio::Format>,
+    virtual_track: &VirtualCueTrack,
+    range: Option<axum_extra::headers::Range>,
+) -> Result<crate::http::binary::Response, Error> {
+    let prepared =
+        flac_split::prepare_virtual_flac_track(filesystem, config, cache_key, virtual_track).await?;
+    flac_split::response_from_prepared_track(prepared, range).await
 }
 
 /// Construct a stable "virtual relative path" for a track of a CUE sheet.
@@ -347,9 +278,9 @@ FILE "Album.flac" WAVE
     INDEX 01 00:10:00
 "#;
         let parsed = CueSheet::parse_str(cue).unwrap();
-        assert_eq!(parsed.performer.as_deref(), Some("Artist"));
-        assert_eq!(parsed.title.as_deref(), Some("Album"));
-        assert_eq!(parsed.date.as_deref(), Some("2000-12-31"));
+        assert_eq!(parsed.performer(), Some("Artist"));
+        assert_eq!(parsed.title(), Some("Album"));
+        assert_eq!(parsed.date(), Some("2000-12-31"));
         assert!(parsed.is_single_file());
         assert!(parsed.file_name_matches("Album.flac"));
 

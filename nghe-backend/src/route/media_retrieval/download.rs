@@ -6,12 +6,11 @@ use uuid::Uuid;
 use crate::Error;
 use crate::cue;
 use crate::database::Database;
-use crate::file::audio::transcode;
 use crate::file::{self, audio};
 use crate::filesystem::{self, Filesystem, Trait};
 use crate::http::binary;
 use crate::http::header::ToOffset;
-use crate::{config, error};
+use crate::config;
 
 pub async fn handler_impl(
     filesystem: filesystem::Impl<'_>,
@@ -36,37 +35,14 @@ pub async fn handler(
     if let Some(virtual_track) =
         cue::VirtualCueTrack::parse_virtual_track_path(source.path.to_path())
     {
-        // TODO: Range requests on virtual tracks are not supported for now.
-        let _ = range;
-
-        let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
-        let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
-
-        let span = cue_sheet
-            .resolve_track_span(virtual_track.track_number)
-            .ok_or_else(|| error::Kind::NotFound)?;
-        let audio_path = cue_sheet
-            .resolve_audio_file_path(virtual_track.cue_path.to_path())
-            .ok_or_else(|| error::Kind::NotFound)?;
-
-        let input = filesystem.transcode_input(audio_path.to_path()).await?;
-        let trim = transcode::Trim { start: span.start_seconds, duration: span.duration_seconds };
-
-        // Bitrate is ignored by some encoders (e.g. FLAC). Use a reasonable default.
-        let (rx, _handle) = transcode::Transcoder::spawn(
+        return cue::virtual_flac_track_response(
+            &filesystem,
             &config,
-            transcode::Path { input, output: None },
-            nghe_api::common::format::Transcode::Flac,
-            320,
-            trim,
-        );
-
-        return binary::Response::from_rx(
-            rx,
-            nghe_api::common::format::Transcode::Flac,
-            #[cfg(test)]
-            None::<crate::test::binary::Status>,
-        );
+            &source.property,
+            &virtual_track,
+            range,
+        )
+        .await;
     }
 
     let offset = range.map(|range| range.to_offset(source.property.size.into())).transpose()?;

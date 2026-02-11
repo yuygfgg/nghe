@@ -264,6 +264,8 @@ pub enum Kind {
 #[from_owned(tokio::sync::AcquireError)]
 #[from_owned(std::ffi::NulError)]
 #[from_owned(std::str::Utf8Error)]
+#[from_owned(cue_rw::CUEParseError)]
+#[from_owned(crate::flac::FlacParseError)]
 #[from_owned(tracing_subscriber::util::TryInitError)]
 #[from_owned(image::ImageError)]
 pub struct Error {
