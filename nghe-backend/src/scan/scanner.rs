@@ -390,7 +390,16 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         }
 
         while let Some(result) = join_set.join_next().await {
-            result??;
+            match result {
+                Ok(Ok(_song_id)) => {}
+                Ok(Err(_error)) => {
+                    // Keep scanning other files even if this one fails to parse.
+                }
+                Err(error) => {
+                    // A join error means the task panicked or was cancelled.
+                    tracing::error!(?error, "scan worker task failed");
+                }
+            }
         }
         scan_handle.await??;
 

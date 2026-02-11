@@ -79,9 +79,9 @@ impl Output {
 
         // bit to kbit
         let bitrate = bitrate * 1000;
-        // Opus sample rate will always be 48000Hz.
-        let sample_rate =
-            if codec.id == ffi::AV_CODEC_ID_OPUS { 48000 } else { decoder.sample_rate };
+        // Pick an encoder sample-rate that the codec supports. Some encoders (e.g. libmp3lame)
+        // only accept a fixed set, so we need to downsample.
+        let sample_rate = select_sample_rate(&codec, decoder.sample_rate);
 
         let mut encoder = AVCodecContext::new(&codec);
         encoder.set_ch_layout(decoder.ch_layout);
@@ -137,6 +137,39 @@ impl Output {
     }
 }
 
+fn select_sample_rate(codec: &AVCodec, input_sample_rate: i32) -> i32 {
+    // Opus sample rate will always be 48000Hz.
+    if codec.id == ffi::AV_CODEC_ID_OPUS {
+        return 48_000;
+    }
+
+    let Some(rates) = codec.supported_samplerates() else {
+        return input_sample_rate;
+    };
+
+    if rates.contains(&input_sample_rate) {
+        return input_sample_rate;
+    }
+
+    // Prefer 48k/44.1k if supported; choose an integer downsample if possible.
+    if rates.contains(&48_000) && input_sample_rate % 48_000 == 0 {
+        return 48_000;
+    }
+    if rates.contains(&44_100) && input_sample_rate % 44_100 == 0 {
+        return 44_100;
+    }
+    if rates.contains(&48_000) {
+        return 48_000;
+    }
+    if rates.contains(&44_100) {
+        return 44_100;
+    }
+
+    // Fall back to the first supported sample-rate (FFmpeg terminates this list with 0,
+    // which rsmpeg filters out).
+    rates.first().copied().unwrap_or(input_sample_rate)
+}
+
 impl Graph {
     fn new(decoder: &AVCodecContext, encoder: &AVCodecContext, offset: u32) -> Result<Self, Error> {
         let mut specs: Vec<Cow<'static, str>> = vec![];
@@ -144,7 +177,11 @@ impl Graph {
             specs.push(concat_string!("atrim=start=", offset.to_string()).into());
         }
         if decoder.sample_rate != encoder.sample_rate {
-            specs.push("aresample=resampler=soxr".into());
+            // Don't force `soxr` here: some FFmpeg builds (e.g. Homebrew without libsoxr) don't
+            // have it enabled and will fail with "Requested resampling engine is unavailable".
+            // `aresample` will use the default resampler (libswresample) and still convert to the
+            // sink's configured sample rate.
+            specs.push("aresample".into());
         }
         if encoder.frame_size > 0 {
             specs.push(

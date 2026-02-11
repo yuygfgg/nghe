@@ -3,7 +3,7 @@ use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
-use super::{Home, Loading, Root, Users, authentication};
+use super::{Home, Loading, Root, ScanFolder, Users, authentication};
 
 pub fn Body() -> impl IntoView {
     html::div().class("flex h-dvh box-border").child(Router(
@@ -33,6 +33,12 @@ pub fn Body() -> impl IntoView {
                                         component_props_builder(&Route)
                                             .path(path!("/users"))
                                             .view(Users)
+                                            .build(),
+                                    ),
+                                    Route(
+                                        component_props_builder(&Route)
+                                            .path(path!("/scan"))
+                                            .view(ScanFolder)
                                             .build(),
                                     ),
                                     Route(

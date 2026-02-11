@@ -44,21 +44,48 @@ impl<'a> Artist<'a> {
         names: impl Iterator<Item = &'a str>,
         mbz_ids: impl Iterator<Item = &'a str>,
     ) -> Result<IndexSet<Self>, Error> {
-        names
-            .zip_longest(mbz_ids)
-            .map(|iter| match iter {
-                itertools::EitherOrBoth::Both(name, mbz_id) => Ok(Self {
-                    name: name.into(),
-                    mbz_id: {
+        // Tags in the wild sometimes contain empty segments such as "Artist1;;Artist2".
+        // Treat empty/whitespace items as "missing" instead of aborting the whole scan.
+        let mut out = IndexSet::<Self>::new();
+
+        for iter in names.zip_longest(mbz_ids) {
+            match iter {
+                itertools::EitherOrBoth::Both(name, mbz_id) => {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+
+                    let mbz_id = mbz_id.trim();
+                    let mbz_id = if mbz_id.is_empty() {
+                        None
+                    } else {
                         let mbz_id = Uuid::from_str(mbz_id)
                             .map_err(|_| error::Kind::InvalidMbzIdTagFormat(mbz_id.to_owned()))?;
                         if mbz_id.is_nil() { None } else { Some(mbz_id) }
-                    },
-                }),
-                itertools::EitherOrBoth::Left(name) => Ok(Self { name: name.into(), mbz_id: None }),
-                itertools::EitherOrBoth::Right(_) => error::Kind::InvalidMbzIdSize.into(),
-            })
-            .try_collect()
+                    };
+
+                    out.insert(Self { name: name.into(), mbz_id });
+                }
+                itertools::EitherOrBoth::Left(name) => {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    out.insert(Self { name: name.into(), mbz_id: None });
+                }
+                itertools::EitherOrBoth::Right(mbz_id) => {
+                    // Extra MusicBrainz IDs without a matching artist name is usually malformed,
+                    // but allow empty items so we can continue scanning.
+                    if mbz_id.trim().is_empty() {
+                        continue;
+                    }
+                    return error::Kind::InvalidMbzIdSize.into();
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn index(&self, prefixes: &[impl AsRef<str>]) -> Result<char, Error> {
@@ -114,13 +141,12 @@ impl<'a> Artists<'a> {
         album: impl IntoIterator<Item = Artist<'a>>,
         compilation: bool,
     ) -> Result<Self, Error> {
-        let song: IndexSet<_> = song.into_iter().collect();
+        let mut song: IndexSet<_> = song.into_iter().collect();
         let album = album.into_iter().collect();
         if song.is_empty() {
-            error::Kind::MissingSongArtistName.into()
-        } else {
-            Ok(Self { song, album, compilation })
+            song.insert(Artist { name: Cow::Borrowed("Unknown Artist"), mbz_id: None });
         }
+        Ok(Self { song, album, compilation })
     }
 
     pub fn song(&self) -> &IndexSet<Artist<'a>> {

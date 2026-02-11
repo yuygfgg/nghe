@@ -1,3 +1,5 @@
+use diesel::ExpressionMethods;
+use diesel::upsert::excluded;
 use diesel_async::RunQueryDsl;
 pub use nghe_api::music_folder::add::{Request, Response};
 use nghe_proc_macro::handler;
@@ -16,8 +18,15 @@ async fn handler_impl(
 ) -> Result<Response, Error> {
     filesystem.check_folder(request.path.as_str().into()).await?;
 
+    let upsert = music_folders::Upsert::from(&request);
     let music_folder_id = diesel::insert_into(music_folders::table)
-        .values(music_folders::Upsert::from(&request))
+        .values(upsert)
+        .on_conflict(music_folders::path)
+        .do_update()
+        .set((
+            music_folders::name.eq(excluded(music_folders::name)),
+            music_folders::fs_type.eq(excluded(music_folders::fs_type)),
+        ))
         .returning(music_folders::id)
         .get_result::<Uuid>(&mut database.get().await?)
         .await?;

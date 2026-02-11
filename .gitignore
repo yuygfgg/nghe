@@ -38,6 +38,7 @@
 ### direnv ###
 .direnv
 .envrc
+.env
 
 ### Linux ###
 *~
@@ -146,3 +147,4 @@ $RECYCLE.BIN/
 hearing-test-output/
 
 # End of https://www.toptal.com/developers/gitignore/api/c++,rust,linux,macos,windows,rust-analyzer,visualstudiocode,direnv
+AGENTS.md

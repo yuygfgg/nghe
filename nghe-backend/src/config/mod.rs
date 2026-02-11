@@ -37,6 +37,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        Self::load().expect("Could not parse config")
+    }
+}
+
+impl Config {
+    pub fn load() -> Result<Self, figment::Error> {
         Figment::new()
             .merge(Env::prefixed(const_format::concatcp!(constant::SERVER_NAME, "_")).split("__"))
             .join(Serialized::default("server", Server::default()))
@@ -48,6 +54,5 @@ impl Default for Config {
             .join(Serialized::default("integration", Integration::default()))
             .join(Serialized::default("log", Log::default()))
             .extract()
-            .expect("Could not parse config")
     }
 }
