@@ -243,7 +243,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         started_at: time::OffsetDateTime,
         dir_image_id: Option<Uuid>,
         flac_relative_path: Utf8TypedPath<'_>,
-        _cue_path: Utf8TypedPath<'_>,
+        embedded: bool,
         cue_hash: u64,
         cue_sheet: &cue::CueSheet,
         base_information: &audio::Information<'_>,
@@ -254,18 +254,22 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
             return error::Kind::MissingPathExtension(flac_relative_path.to_path_buf()).into();
         };
 
-        if !cue_sheet.is_single_file() || !cue_sheet.file_name_matches(audio_file_name) {
+        if !cue_sheet.is_single_file()
+            || (!embedded && !cue_sheet.file_name_matches(audio_file_name))
+        {
             return error::Kind::NotFound.into();
         }
 
-        let cue_relative_path = flac_relative_path.to_path_buf().with_extension("cue");
+        let cue_source_relative_path = if embedded {
+            flac_relative_path.to_path_buf()
+        } else {
+            flac_relative_path.to_path_buf().with_extension("cue")
+        };
 
         let base_album = &base_information.metadata.album;
         let album_name = cue_sheet.title().unwrap_or(base_album.name.as_ref()).to_owned();
-        let album_date = cue_sheet
-            .date()
-            .and_then(|s| s.parse::<audio::Date>().ok())
-            .unwrap_or(base_album.date);
+        let album_date =
+            cue_sheet.date().and_then(|s| s.parse::<audio::Date>().ok()).unwrap_or(base_album.date);
 
         let album_artist_fallback = base_information
             .metadata
@@ -274,10 +278,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
             .first()
             .map(|a| a.name.as_ref())
             .unwrap_or("Unknown Artist");
-        let album_artist_name = cue_sheet
-            .performer()
-            .unwrap_or(album_artist_fallback)
-            .to_owned();
+        let album_artist_name = cue_sheet.performer().unwrap_or(album_artist_fallback).to_owned();
 
         // Upsert album once; track songs will reference it.
         let album_id = audio::Album {
@@ -334,17 +335,15 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                 continue;
             }
 
-            let duration_seconds = span
-                .duration_seconds
-                .unwrap_or(total_duration_s - start_seconds)
-                .max(0.0);
+            let duration_seconds =
+                span.duration_seconds.unwrap_or(total_duration_s - start_seconds).max(0.0);
 
             if duration_seconds == 0.0 {
                 continue;
             }
 
             let track_relative_path = cue::build_virtual_track_relative_path(
-                cue_relative_path.to_path(),
+                cue_source_relative_path.to_path(),
                 track_number,
                 audio::Format::Flac,
             )?;
@@ -398,8 +397,8 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                             original_release_date: audio::Date::default(),
                             mbz_id: None,
                         },
-                            track_disc: audio::TrackDisc {
-                                track: audio::position::Position {
+                        track_disc: audio::TrackDisc {
+                            track: audio::position::Position {
                                 number: Some(track_number),
                                 total: track_total,
                             },
@@ -477,26 +476,32 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
     async fn one(&self, entry: &Entry, started_at: time::OffsetDateTime) -> Result<Uuid, Error> {
         let database = &self.database;
 
-        let cue = if entry.format == audio::Format::Flac {
+        enum CueSource {
+            Sidecar { cue_hash: u64, cue_sheet: cue::CueSheet },
+            Embedded { cue_hash: u64, cue_sheet: cue::CueSheet },
+        }
+
+        let cue: Option<CueSource> = if entry.format == audio::Format::Flac {
+            let mut cue: Option<CueSource> = None;
+
+            // 1) Sidecar `.cue` file next to the FLAC (preferred).
             let cue_path = entry.path.clone().with_extension("cue");
             if self.filesystem.exists(cue_path.to_path()).await? {
-                match self.filesystem.read(cue_path.to_path()).await {
+                cue = match self.filesystem.read(cue_path.to_path()).await {
                     Ok(bytes) => {
                         let cue_hash = xxh3_64(&bytes);
                         match cue::CueSheet::parse(&bytes) {
                             Ok(sheet) => {
                                 let audio_file_name = entry.path.file_name().unwrap_or_default();
                                 let file_id = cue_rw::FileID::from(0usize);
-                                let has_track_index = sheet
-                                    .cue()
-                                    .tracks
-                                    .iter()
-                                    .any(|(fid, t)| *fid == file_id && t.indices.iter().any(|(id, _)| *id == 1));
+                                let has_track_index = sheet.cue().tracks.iter().any(|(fid, t)| {
+                                    *fid == file_id && t.indices.iter().any(|(id, _)| *id == 1)
+                                });
                                 if has_track_index
                                     && sheet.is_single_file()
                                     && sheet.file_name_matches(audio_file_name)
                                 {
-                                    Some((cue_path, cue_hash, sheet))
+                                    Some(CueSource::Sidecar { cue_hash, cue_sheet: sheet })
                                 } else {
                                     None
                                 }
@@ -511,10 +516,63 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                         tracing::debug!(?error, path = %cue_path, "failed to read cue file");
                         None
                     }
-                }
-            } else {
-                None
+                };
             }
+
+            // 2) Embedded cue sheet in FLAC Vorbis comments.
+            if cue.is_none() {
+                // For local filesystem we can do this with a small metadata-only read. For S3 we
+                // currently skip this to avoid downloading the entire audio object during scans.
+                cue = match &self.filesystem {
+                    filesystem::Impl::Local(_) => {
+                        let platform_path = crate::filesystem::local::Filesystem::to_platform(
+                            entry.path.to_path(),
+                        )?;
+                        let file = std::fs::File::open(platform_path.as_str())?;
+                        let mut reader = std::io::BufReader::new(file);
+                        match crate::flac::extract_embedded_cuesheet_from_reader(&mut reader) {
+                            Ok(Some(cue_str)) => {
+                                let cue_hash = xxh3_64(cue_str.as_bytes());
+                                match cue::CueSheet::parse_str(&cue_str) {
+                                    Ok(sheet) => {
+                                        let file_id = cue_rw::FileID::from(0usize);
+                                        let has_track_index =
+                                            sheet.cue().tracks.iter().any(|(fid, t)| {
+                                                *fid == file_id
+                                                    && t.indices.iter().any(|(id, _)| *id == 1)
+                                            });
+                                        if has_track_index && sheet.is_single_file() {
+                                            Some(CueSource::Embedded { cue_hash, cue_sheet: sheet })
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            ?error,
+                                            path = %entry.path,
+                                            "invalid embedded cuesheet"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Ok(None) => None,
+                            Err(error) => {
+                                tracing::debug!(
+                                    ?error,
+                                    path = %entry.path,
+                                    "failed to parse embedded cuesheet"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    filesystem::Impl::S3(_) => None,
+                };
+            }
+
+            cue
         } else {
             None
         };
@@ -655,13 +713,17 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         let information = audio.extract(&self.config.parsing)?;
         tracing::trace!(?information);
 
-        if let Some((cue_path, cue_hash, cue_sheet)) = cue {
+        if let Some(cue) = cue {
+            let (embedded, cue_hash, cue_sheet) = match cue {
+                CueSource::Sidecar { cue_hash, cue_sheet } => (false, cue_hash, cue_sheet),
+                CueSource::Embedded { cue_hash, cue_sheet } => (true, cue_hash, cue_sheet),
+            };
             return self
                 .upsert_cue_flac(
                     started_at,
                     dir_image_id,
                     relative_path,
-                    cue_path.to_path(),
+                    embedded,
                     cue_hash,
                     &cue_sheet,
                     &information,

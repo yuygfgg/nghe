@@ -56,14 +56,45 @@ pub async fn handler(
     let mut audio_source_path = source_path.to_path_buf();
 
     if let Some(virtual_track) = virtual_track {
-        let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
-        let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
+        let cue_source_path = virtual_track.cue_path.to_path();
+        let is_embedded =
+            cue_source_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("flac"));
+
+        let (cue_sheet, audio_path) = if is_embedded {
+            match &filesystem {
+                crate::filesystem::Impl::Local(_) => {
+                    let platform_path =
+                        crate::filesystem::local::Filesystem::to_platform(cue_source_path)?;
+                    let file = std::fs::File::open(platform_path.as_str())?;
+                    let mut reader = std::io::BufReader::new(file);
+                    let cue_str = crate::flac::extract_embedded_cuesheet_from_reader(&mut reader)?
+                        .ok_or_else(|| error::Kind::NotFound)?;
+                    let cue_sheet = cue::CueSheet::parse_str(&cue_str)?;
+                    (cue_sheet, virtual_track.cue_path.clone())
+                }
+                crate::filesystem::Impl::S3(_) => {
+                    // Download the object and parse the embedded cue sheet from bytes.
+                    // TODO: This is less efficient than using a range request.
+                    // But it's fine now since we don't even scan for embedded cue sheets on S3.
+                    // Technically unreachable.
+                    let bytes = filesystem.read(cue_source_path).await?;
+                    let cue_str = crate::flac::extract_embedded_cuesheet_from_bytes(&bytes)?
+                        .ok_or_else(|| error::Kind::NotFound)?;
+                    let cue_sheet = cue::CueSheet::parse_str(&cue_str)?;
+                    (cue_sheet, virtual_track.cue_path.clone())
+                }
+            }
+        } else {
+            let cue_bytes = filesystem.read(cue_source_path).await?;
+            let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
+            let audio_path = cue_sheet
+                .resolve_audio_file_path(cue_source_path)
+                .ok_or_else(|| error::Kind::NotFound)?;
+            (cue_sheet, audio_path)
+        };
 
         let span = cue_sheet
             .resolve_track_span(virtual_track.track_number)
-            .ok_or_else(|| error::Kind::NotFound)?;
-        let audio_path = cue_sheet
-            .resolve_audio_file_path(virtual_track.cue_path.to_path())
             .ok_or_else(|| error::Kind::NotFound)?;
 
         base_trim = transcode::Trim { start: span.start_seconds, duration: span.duration_seconds };

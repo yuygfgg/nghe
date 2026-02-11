@@ -32,12 +32,42 @@ pub(crate) async fn prepare_virtual_flac_track(
     cache_key: &file::Property<audio::Format>,
     virtual_track: &VirtualCueTrack,
 ) -> Result<PreparedTrack, Error> {
-    let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
-    let cue_sheet = CueSheet::parse(&cue_bytes)?;
+    let cue_source_path = virtual_track.cue_path.to_path();
+    let is_embedded = cue_source_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"));
 
-    let audio_path = cue_sheet
-        .resolve_audio_file_path(virtual_track.cue_path.to_path())
-        .ok_or_else(|| error::Kind::NotFound)?;
+    let (cue_sheet, audio_path, embedded_audio_bytes): (CueSheet, typed_path::Utf8TypedPathBuf, Option<Vec<u8>>) =
+        if is_embedded {
+            match filesystem {
+                filesystem::Impl::Local(_) => {
+                    let platform_path =
+                        crate::filesystem::local::Filesystem::to_platform(cue_source_path)?;
+                    let file = std::fs::File::open(platform_path.as_str())?;
+                    let mut reader = std::io::BufReader::new(file);
+                    let cue_str = crate::flac::extract_embedded_cuesheet_from_reader(&mut reader)?
+                        .ok_or_else(|| error::Kind::NotFound)?;
+                    let cue_sheet = CueSheet::parse_str(&cue_str)?;
+                    (cue_sheet, virtual_track.cue_path.clone(), None)
+                }
+                filesystem::Impl::S3(_) => {
+                    // No cheap range/stream access here; reuse the downloaded bytes for both cue
+                    // extraction and splitting.
+                    let bytes = filesystem.read(cue_source_path).await?;
+                    let cue_str = crate::flac::extract_embedded_cuesheet_from_bytes(&bytes)?
+                        .ok_or_else(|| error::Kind::NotFound)?;
+                    let cue_sheet = CueSheet::parse_str(&cue_str)?;
+                    (cue_sheet, virtual_track.cue_path.clone(), Some(bytes))
+                }
+            }
+        } else {
+            let cue_bytes = filesystem.read(cue_source_path).await?;
+            let cue_sheet = CueSheet::parse(&cue_bytes)?;
+            let audio_path = cue_sheet
+                .resolve_audio_file_path(cue_source_path)
+                .ok_or_else(|| error::Kind::NotFound)?;
+            (cue_sheet, audio_path, None)
+        };
 
     let cache_base_dir = config.cache_dir.as_ref().map(|dir| dir.join("cue_flac"));
     if let Some(cache_base_dir) = cache_base_dir {
@@ -53,10 +83,16 @@ pub(crate) async fn prepare_virtual_flac_track(
         let track_number = virtual_track.track_number;
 
         let input = match filesystem {
-            filesystem::Impl::Local(_) => Input::LocalPath(filesystem::local::Filesystem::to_platform(
-                audio_path.to_path(),
-            )?),
-            filesystem::Impl::S3(_) => Input::Bytes(filesystem.read(audio_path.to_path()).await?),
+            filesystem::Impl::Local(_) => Input::LocalPath(
+                filesystem::local::Filesystem::to_platform(audio_path.to_path())?,
+            ),
+            filesystem::Impl::S3(_) => {
+                if let Some(bytes) = embedded_audio_bytes {
+                    Input::Bytes(bytes)
+                } else {
+                    Input::Bytes(filesystem.read(audio_path.to_path()).await?)
+                }
+            }
         };
 
         let output_cloned = output.clone();
@@ -82,10 +118,16 @@ pub(crate) async fn prepare_virtual_flac_track(
     let track_number = virtual_track.track_number;
 
     let input = match filesystem {
-        filesystem::Impl::Local(_) => Input::LocalPath(filesystem::local::Filesystem::to_platform(
-            audio_path.to_path(),
-        )?),
-        filesystem::Impl::S3(_) => Input::Bytes(filesystem.read(audio_path.to_path()).await?),
+        filesystem::Impl::Local(_) => {
+            Input::LocalPath(filesystem::local::Filesystem::to_platform(audio_path.to_path())?)
+        }
+        filesystem::Impl::S3(_) => {
+            if let Some(bytes) = embedded_audio_bytes {
+                Input::Bytes(bytes)
+            } else {
+                Input::Bytes(filesystem.read(audio_path.to_path()).await?)
+            }
+        }
     };
 
     let body = tokio::task::spawn_blocking(move || {
@@ -386,8 +428,10 @@ fn process_metadata(
     track_total: usize,
     track_number: u16,
 ) {
-    vorbis_comment.user_comments.remove("cuesheet");
-    vorbis_comment.user_comments.remove("CUESHEET");
+    // Strip embedded cue sheet tags (any casing) from per-track output.
+    vorbis_comment
+        .user_comments
+        .retain(|k, _| !k.eq_ignore_ascii_case("cuesheet"));
 
     let Some((_, cue_track)) = cue.tracks.get(track_id) else {
         return;

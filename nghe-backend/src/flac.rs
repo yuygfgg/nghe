@@ -20,6 +20,8 @@ use crate::utils::{InvalidPointerError, SliceReadExt};
 pub enum FlacParseError {
     #[error("early end on parsed bytes")]
     EarlyEnd,
+    #[error("FLAC stream marker (fLaC) not found")]
+    FlacMarkerNotFound,
     #[error("invalid or reserved metadata block type {0}")]
     InvalidMetadataBlockType(u8),
     #[error("invalid picture type {0}")]
@@ -138,7 +140,9 @@ pub enum FlacMetadataBlockType {
     Picture = 6,
 }
 
-// TODO: Support FLAC with embedded CUE file (through cuesheet in vorbis comment metadata)
+/// Note: the FLAC-embedded `CUESHEET` metadata block is not used, as it only carries TOC-like data
+/// (not the textual cue sheet). Instead, we support textual cue sheets embedded as a Vorbis comment
+/// tag (commonly `cuesheet` / `CUESHEET`).
 #[derive(Clone, Debug)]
 pub enum FlacMetadataBlockContent {
     StreamInfo(StreamInfoBlock),
@@ -383,6 +387,158 @@ impl VorbisCommentBlock {
 
     pub fn get(&self, key: &String) -> Option<&String> {
         self.user_comments.get(key)
+    }
+
+    pub fn get_case_insensitive(&self, key: &str) -> Option<&String> {
+        self.user_comments
+            .iter()
+            .find_map(|(k, v)| if k.eq_ignore_ascii_case(key) { Some(v) } else { None })
+    }
+}
+
+fn seek_to_flac_stream_marker(reader: &mut (impl Read + Seek)) -> Result<(), FlacParseError> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut head = [0u8; 4];
+    if reader.read_exact(&mut head).is_ok() && &head == b"fLaC" {
+        return Ok(());
+    }
+
+    // Slow-path scan: search for "fLaC" marker and seek to it.
+    reader.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut window: [u8; 4] = [0; 4];
+    let mut have: usize = 0;
+    let mut pos: u64 = 0;
+
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+
+        for &b in &buf[..read] {
+            if have < 4 {
+                window[have] = b;
+                have += 1;
+            } else {
+                window[0] = window[1];
+                window[1] = window[2];
+                window[2] = window[3];
+                window[3] = b;
+            }
+            pos += 1;
+
+            if have == 4 && window == *b"fLaC" {
+                let marker_start = pos - 4;
+                reader.seek(SeekFrom::Start(marker_start + 4))?;
+                return Ok(());
+            }
+        }
+    }
+
+    Err(FlacParseError::FlacMarkerNotFound)
+}
+
+pub fn extract_embedded_cuesheet_from_reader(
+    reader: &mut (impl Read + Seek),
+) -> Result<Option<String>, FlacParseError> {
+    // Some files may have leading tags (e.g. ID3); seek to the actual FLAC stream first.
+    seek_to_flac_stream_marker(reader)?;
+
+    let mut blocks = vec![];
+    loop {
+        let block = FlacMetadataBlock::read_block_sync(&mut *reader)?;
+        let is_last = block.is_last;
+        blocks.push(block);
+        if is_last {
+            break;
+        }
+    }
+
+    let vorbis_comment = blocks
+        .iter()
+        .find(|b| b.block_type == FlacMetadataBlockType::VorbisComment);
+    let Some(FlacMetadataBlockContent::VorbisComment(vorbis_comment)) =
+        vorbis_comment.map(|b| &b.content)
+    else {
+        return Ok(None);
+    };
+
+    Ok(vorbis_comment
+        .get_case_insensitive("cuesheet")
+        .cloned())
+}
+
+pub fn extract_embedded_cuesheet_from_bytes(bytes: &[u8]) -> Result<Option<String>, FlacParseError> {
+    let mut cursor = Cursor::new(bytes);
+    extract_embedded_cuesheet_from_reader(&mut cursor)
+}
+
+#[cfg(test)]
+mod embedded_cue_tests {
+    use super::*;
+
+    fn make_minimal_stream_info() -> StreamInfoBlock {
+        StreamInfoBlock {
+            min_block_size: 4096,
+            max_block_size: 4096,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: 44_100,
+            channels: 1,        // stored as (channels - 1); 2ch
+            bits_per_sample: 15, // stored as (bits - 1); 16-bit
+            sample_count: 0,
+            md5: [0; 16],
+        }
+    }
+
+    #[test]
+    fn test_extract_embedded_cuesheet_from_bytes_with_leading_junk() {
+        let cue_data = "PERFORMER \"A\"\nTITLE \"B\"\nFILE \"X.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+
+        let mut vorbis = VorbisCommentBlock::new();
+        vorbis.add_vorbis_comment("CUESHEET", cue_data);
+
+        let blocks = vec![
+            FlacMetadataBlock {
+                is_last: false,
+                block_type: FlacMetadataBlockType::StreamInfo,
+                content: FlacMetadataBlockContent::StreamInfo(make_minimal_stream_info()),
+            },
+            FlacMetadataBlock {
+                is_last: true,
+                block_type: FlacMetadataBlockType::VorbisComment,
+                content: FlacMetadataBlockContent::VorbisComment(vorbis),
+            },
+        ];
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"JUNKJUNK");
+        bytes.extend_from_slice(b"fLaC");
+        for b in blocks {
+            b.write_block(&mut bytes).unwrap();
+        }
+
+        let extracted = extract_embedded_cuesheet_from_bytes(&bytes).unwrap().unwrap();
+        assert_eq!(extracted, cue_data);
+    }
+
+    #[test]
+    fn test_extract_embedded_cuesheet_from_bytes_missing() {
+        let blocks = vec![FlacMetadataBlock {
+            is_last: true,
+            block_type: FlacMetadataBlockType::StreamInfo,
+            content: FlacMetadataBlockContent::StreamInfo(make_minimal_stream_info()),
+        }];
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"fLaC");
+        for b in blocks {
+            b.write_block(&mut bytes).unwrap();
+        }
+
+        let extracted = extract_embedded_cuesheet_from_bytes(&bytes).unwrap();
+        assert!(extracted.is_none());
     }
 }
 

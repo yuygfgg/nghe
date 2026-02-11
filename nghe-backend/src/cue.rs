@@ -10,10 +10,14 @@ use crate::{Error, file};
 
 mod flac_split;
 
-/// Marker directory suffix for "virtual files" derived from a `.cue` sheet.
+/// Marker directory suffix for "virtual files" derived from a cue sheet.
 ///
 /// Example virtual track path:
 /// `Album.cue.__nghe_cue__/01.flac`
+///
+/// For FLAC files with an embedded cue sheet (stored in Vorbis comments as `cuesheet`/`CUESHEET`),
+/// we use the FLAC filename as the virtual directory base:
+/// `Album.flac.__nghe_cue__/01.flac`.
 pub const VIRTUAL_DIR_SUFFIX: &str = ".__nghe_cue__";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,7 +48,8 @@ impl VirtualCueTrack {
         let virtual_dir = path.parent()?;
         let virtual_dir_name = virtual_dir.file_name()?;
         let cue_file_name = virtual_dir_name.strip_suffix(VIRTUAL_DIR_SUFFIX)?;
-        if !cue_file_name.to_ascii_lowercase().ends_with(".cue") {
+        let cue_file_name_lower = cue_file_name.to_ascii_lowercase();
+        if !(cue_file_name_lower.ends_with(".cue") || cue_file_name_lower.ends_with(".flac")) {
             return None;
         }
 
@@ -314,5 +319,20 @@ FILE "Album.flac" WAVE
         let rel = build_virtual_track_relative_path(cue_rel, 1, file::audio::Format::Flac).unwrap();
         assert!(rel.as_str().ends_with("/01.flac"));
         assert!(rel.as_str().contains(VIRTUAL_DIR_SUFFIX));
+    }
+
+    #[test]
+    fn test_virtual_path_embedded_flac_roundtrip() {
+        let builder = fs::path::Builder(filesystem::Type::Local);
+        let flac_rel = builder.from_str(&"a/b/Album.flac");
+        let rel =
+            build_virtual_track_relative_path(flac_rel, 7, file::audio::Format::Flac).unwrap();
+
+        let prefix = builder.from_str(&"/music");
+        let abs = prefix.join(rel);
+
+        let parsed = VirtualCueTrack::parse_virtual_track_path(abs.to_path()).unwrap();
+        assert_eq!(parsed.track_number, 7);
+        assert_eq!(parsed.cue_path.as_str(), "/music/a/b/Album.flac");
     }
 }
