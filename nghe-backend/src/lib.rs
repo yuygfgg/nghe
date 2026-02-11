@@ -14,6 +14,7 @@
 #[coverage(off)]
 pub mod config;
 mod constant;
+mod cue;
 mod database;
 #[coverage(off)]
 mod error;

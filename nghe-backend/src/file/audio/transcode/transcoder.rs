@@ -12,6 +12,7 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::{UnsafeDerefMut, avutil, ffi};
 use tracing::instrument;
 
+use super::Trim;
 use super::{Path, Sink};
 use crate::{Error, config, error};
 
@@ -171,10 +172,16 @@ fn select_sample_rate(codec: &AVCodec, input_sample_rate: i32) -> i32 {
 }
 
 impl Graph {
-    fn new(decoder: &AVCodecContext, encoder: &AVCodecContext, offset: u32) -> Result<Self, Error> {
+    fn new(decoder: &AVCodecContext, encoder: &AVCodecContext, trim: Trim) -> Result<Self, Error> {
         let mut specs: Vec<Cow<'static, str>> = vec![];
-        if offset > 0 {
-            specs.push(concat_string!("atrim=start=", offset.to_string()).into());
+        if trim.start > 0.0 || trim.duration.is_some() {
+            let start = fmt_seconds(trim.start);
+            if let Some(duration) = trim.duration {
+                let duration = fmt_seconds(duration);
+                specs.push(concat_string!("atrim=start=", start, ":duration=", duration).into());
+            } else {
+                specs.push(concat_string!("atrim=start=", start).into());
+            }
         }
         if decoder.sample_rate != encoder.sample_rate {
             // Don't force `soxr` here: some FFmpeg builds (e.g. Homebrew without libsoxr) don't
@@ -194,6 +201,16 @@ impl Graph {
 
         Ok(Self { filter: AVFilterGraph::new(), spec })
     }
+}
+
+fn fmt_seconds(seconds: f64) -> String {
+    // Avoid scientific notation and limit precision to milliseconds, which is enough for CUE
+    // (1 frame = 1/75s ~= 13.33ms).
+    let seconds = seconds.max(0.0);
+    let ms = (seconds * 1000.0).round() as u64;
+    let s = ms / 1000;
+    let ms = ms % 1000;
+    if ms == 0 { s.to_string() } else { format!("{s}.{ms:03}") }
 }
 
 impl<'graph> Filter<'graph> {
@@ -272,7 +289,7 @@ impl Transcoder {
         path: Path,
         format: nghe_api::common::format::Transcode,
         bitrate: u32,
-        offset: u32,
+        trim: Trim,
     ) -> (Receiver<Vec<u8>>, tokio::task::JoinHandle<Result<(), Error>>) {
         let (tx, rx) = crate::sync::channel(config.channel_size);
         let buffer_size = config.buffer_size;
@@ -285,7 +302,7 @@ impl Transcoder {
             let file = atomic_file.as_ref().map(|file| file.as_file().try_clone()).transpose()?;
             let sink = Sink { tx, buffer_size, format, file };
 
-            let mut transcoder = Self::new(&CString::new(path.input)?, sink, bitrate, offset)?;
+            let mut transcoder = Self::new(&CString::new(path.input)?, sink, bitrate, trim)?;
             transcoder.transcode()?;
             atomic_file.map(AtomicWriteFile::commit).transpose()?;
             Ok(())
@@ -294,10 +311,10 @@ impl Transcoder {
         (rx, handle)
     }
 
-    fn new(input: &CStr, sink: Sink, bitrate: u32, offset: u32) -> Result<Self, Error> {
+    fn new(input: &CStr, sink: Sink, bitrate: u32, trim: Trim) -> Result<Self, Error> {
         let input = Input::new(input)?;
         let output = Output::new(sink, bitrate, &input.decoder)?;
-        let graph = Graph::new(&input.decoder, &output.encoder, offset)?;
+        let graph = Graph::new(&input.decoder, &output.encoder, trim)?;
         Ok(Self { input, output, graph })
     }
 
@@ -367,7 +384,7 @@ mod test {
                 Path { input: input.into(), output: None },
                 format,
                 bitrate,
-                offset,
+                Trim::from_offset(offset),
             );
             let data = rx.into_stream().map(stream::iter).flatten().collect().await;
             handle.await.unwrap().unwrap();

@@ -4,6 +4,7 @@ use nghe_proc_macro::handler;
 use uuid::Uuid;
 
 use super::download;
+use crate::cue;
 use crate::database::Database;
 use crate::file::audio::transcode;
 use crate::filesystem::{Filesystem, Trait};
@@ -11,7 +12,7 @@ use crate::http::binary;
 use crate::http::header::ToOffset;
 #[cfg(test)]
 use crate::test::binary::Status as BinaryStatus;
-use crate::{Error, config};
+use crate::{Error, config, error};
 
 #[handler]
 pub async fn handler(
@@ -24,19 +25,78 @@ pub async fn handler(
 ) -> Result<binary::Response, Error> {
     let (filesystem, source) =
         binary::Source::audio(database, filesystem, user_id, request.id).await?;
-    let size_offset =
-        range.map(|range| range.to_offset(source.property.size.into())).transpose()?;
 
     let bitrate = request.max_bit_rate.unwrap_or(32);
     let time_offset = request.time_offset.unwrap_or(0);
 
+    let source_path = source.path.to_path();
+    let virtual_track = cue::VirtualCueTrack::parse_virtual_track_path(source_path);
+
     let format = match request.format.unwrap_or_default() {
-        Format::Raw => return download::handler_impl(filesystem, source, size_offset).await,
+        Format::Raw => {
+            if let Some(virtual_track) = virtual_track {
+                // TODO: Range requests on virtual tracks are not supported for now.
+                let _ = range;
+
+                let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
+                let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
+
+                let span = cue_sheet
+                    .resolve_track_span(virtual_track.track_number)
+                    .ok_or_else(|| error::Kind::NotFound)?;
+                let audio_path = cue_sheet
+                    .resolve_audio_file_path(virtual_track.cue_path.to_path())
+                    .ok_or_else(|| error::Kind::NotFound)?;
+
+                let offset = time_offset as f64;
+                let trim = transcode::Trim {
+                    start: span.start_seconds + offset,
+                    duration: span.duration_seconds.map(|d| (d - offset).max(0.0)),
+                };
+
+                let input = filesystem.transcode_input(audio_path.to_path()).await?;
+                let (rx, _handle) = transcode::Transcoder::spawn(
+                    &config,
+                    transcode::Path { input, output: None },
+                    nghe_api::common::format::Transcode::Flac,
+                    320,
+                    trim,
+                );
+
+                return binary::Response::from_rx(
+                    rx,
+                    nghe_api::common::format::Transcode::Flac,
+                    #[cfg(test)]
+                    None::<BinaryStatus>,
+                );
+            }
+
+            let size_offset =
+                range.map(|range| range.to_offset(source.property.size.into())).transpose()?;
+            return download::handler_impl(filesystem, source, size_offset).await;
+        }
         Format::Transcode(format) => format,
     };
     let property = source.property.replace(format);
-    let source_path = source.path.to_path();
+    let mut base_trim = transcode::Trim::default();
+    let mut audio_source_path = source_path.to_path_buf();
 
+    if let Some(virtual_track) = virtual_track {
+        let cue_bytes = filesystem.read(virtual_track.cue_path.to_path()).await?;
+        let cue_sheet = cue::CueSheet::parse(&cue_bytes)?;
+
+        let span = cue_sheet
+            .resolve_track_span(virtual_track.track_number)
+            .ok_or_else(|| error::Kind::NotFound)?;
+        let audio_path = cue_sheet
+            .resolve_audio_file_path(virtual_track.cue_path.to_path())
+            .ok_or_else(|| error::Kind::NotFound)?;
+
+        base_trim = transcode::Trim { start: span.start_seconds, duration: span.duration_seconds };
+        audio_source_path = audio_path;
+    }
+
+    let mut use_cached_output_as_input = false;
     let transcode_args = if let Some(ref cache_dir) = config.cache_dir {
         let output = property.path_create_dir(cache_dir, bitrate.to_string()).await?;
         let cache_exists = tokio::fs::try_exists(&output).await?;
@@ -49,12 +109,15 @@ pub async fn handler(
         //  - Otherwise, we only need to stream the transcoded file from local cache.
         if cache_exists {
             if time_offset > 0 {
+                use_cached_output_as_input = true;
                 (
                     transcode::Path { input: output.as_str().to_owned(), output: None },
                     #[cfg(test)]
                     BinaryStatus::UseCachedOutput,
                 )
             } else {
+                let size_offset =
+                    range.map(|range| range.to_offset(property.size.into())).transpose()?;
                 return binary::Response::from_path(
                     output,
                     format,
@@ -72,7 +135,7 @@ pub async fn handler(
             //    chunk to the cache file.
             (
                 transcode::Path {
-                    input: filesystem.transcode_input(source_path).await?,
+                    input: filesystem.transcode_input(audio_source_path.to_path()).await?,
                     output: if time_offset > 0 { None } else { Some(output) },
                 },
                 #[cfg(test)]
@@ -81,14 +144,26 @@ pub async fn handler(
         }
     } else {
         (
-            transcode::Path { input: filesystem.transcode_input(source_path).await?, output: None },
+            transcode::Path {
+                input: filesystem.transcode_input(audio_source_path.to_path()).await?,
+                output: None,
+            },
             #[cfg(test)]
             BinaryStatus::NoCache,
         )
     };
 
-    let (rx, _) =
-        transcode::Transcoder::spawn(&config, transcode_args.0, format, bitrate, time_offset);
+    let offset = time_offset as f64;
+    let trim = if use_cached_output_as_input {
+        transcode::Trim::from_offset(time_offset)
+    } else {
+        transcode::Trim {
+            start: base_trim.start + offset,
+            duration: base_trim.duration.map(|d| (d - offset).max(0.0)),
+        }
+    };
+
+    let (rx, _) = transcode::Transcoder::spawn(&config, transcode_args.0, format, bitrate, trim);
 
     binary::Response::from_rx(
         rx,
@@ -103,12 +178,16 @@ pub async fn handler(
 mod tests {
     use axum::http::StatusCode;
     use axum_extra::headers::HeaderMapExt;
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::RunQueryDsl;
     use itertools::Itertools;
     use nghe_api::common::{filesystem, format};
+    use nghe_api::scan;
     use rstest::rstest;
 
     use super::*;
     use crate::file::audio;
+    use crate::orm::{albums, songs};
     use crate::test::binary::Header as BinaryHeader;
     use crate::test::{Mock, mock};
 
@@ -240,5 +319,114 @@ mod tests {
             assert!(!body.is_empty());
         }
         assert_eq!(binary_status, &[BinaryStatus::UseCachedOutput, BinaryStatus::UseCachedOutput]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_stream_virtual_cue_track(
+        #[future(awt)]
+        #[with(1, 0)]
+        mock: Mock,
+        #[values(filesystem::Type::Local, filesystem::Type::S3)] ty: filesystem::Type,
+    ) {
+        use crate::test::filesystem::Trait as _;
+        use futures_lite::{StreamExt, stream};
+
+        mock.add_music_folder().ty(ty).call().await;
+        let mut music_folder = mock.music_folder(0).await;
+        music_folder
+            .add_audio_filesystem::<&str>()
+            .path("a/Album.flac")
+            .format(audio::Format::Flac)
+            .scan(false)
+            .recompute_dir_image(false)
+            .call()
+            .await;
+
+        let cue_data = r#"
+PERFORMER "Cue Artist"
+TITLE "Cue Album"
+FILE "Album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Two"
+    INDEX 01 00:10:00
+"#;
+        let cue_abs = music_folder.absolutize("a/Album.cue");
+        music_folder.to_impl().write(cue_abs.to_path(), cue_data.as_bytes()).await;
+        music_folder.scan(scan::start::Full::default()).run().await.unwrap();
+
+        let cue_rel = music_folder.path_str(&"a/Album.cue");
+        let rel_track_1 = cue::build_virtual_track_relative_path(cue_rel, 1, audio::Format::Flac)
+            .unwrap()
+            .to_string();
+
+        let song_id: Uuid = {
+            let mut conn = mock.get().await;
+            albums::table
+                .inner_join(songs::table)
+                .filter(albums::music_folder_id.eq(music_folder.id()))
+                .filter(songs::relative_path.eq(&rel_track_1))
+                .select(songs::id)
+                .get_result(&mut conn)
+                .await
+                .unwrap()
+        };
+
+        let config = &mock.config.transcode;
+        let user_id = mock.user_id(0).await;
+        let format = format::Transcode::Opus;
+        let bitrate = 32;
+
+        let expected = {
+            let cue_bytes = music_folder.to_impl().read(cue_abs.to_path()).await.unwrap();
+            let cue_sheet = cue::CueSheet::parse(&cue_bytes).unwrap();
+            let span = cue_sheet.resolve_track_span(1).unwrap();
+            let audio_path = cue_sheet.resolve_audio_file_path(cue_abs.to_path()).unwrap();
+
+            let input = music_folder.to_impl().transcode_input(audio_path.to_path()).await.unwrap();
+            let trim =
+                transcode::Trim { start: span.start_seconds, duration: span.duration_seconds };
+
+            let (rx, handle) = transcode::Transcoder::spawn(
+                config,
+                transcode::Path { input, output: None },
+                format,
+                bitrate,
+                trim,
+            );
+            let data: Vec<u8> = rx.into_stream().map(stream::iter).flatten().collect().await;
+            handle.await.unwrap().unwrap();
+            data
+        };
+
+        let request = Request {
+            id: song_id,
+            max_bit_rate: Some(bitrate),
+            format: Some(format.into()),
+            time_offset: None,
+        };
+
+        let (status, headers, body) =
+            handler(mock.database(), mock.filesystem(), None, config.clone(), user_id, request)
+                .await
+                .unwrap()
+                .extract()
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected);
+        assert_eq!(headers.typed_get::<BinaryHeader>().unwrap().0, BinaryStatus::WithCache);
+
+        let (status, headers, body) =
+            handler(mock.database(), mock.filesystem(), None, config.clone(), user_id, request)
+                .await
+                .unwrap()
+                .extract()
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, expected);
+        assert_eq!(headers.typed_get::<BinaryHeader>().unwrap().0, BinaryStatus::ServeCachedOutput);
     }
 }

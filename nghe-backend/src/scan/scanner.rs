@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use diesel::{
@@ -13,7 +14,9 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, instrument};
 use typed_path::Utf8TypedPath;
 use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_64;
 
+use crate::cue;
 use crate::database::Database;
 use crate::file::{self, File, audio, image, lyric};
 use crate::filesystem::{self, Entry, Filesystem, Trait, entry};
@@ -142,6 +145,34 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
     }
 
     #[cfg_attr(not(coverage_nightly), instrument(skip_all, ret(level = "trace")))]
+    async fn set_scanned_at_relative_path(
+        &self,
+        relative_path: &str,
+        started_at: time::OffsetDateTime,
+    ) -> Result<Option<songs::IdTime>, Error> {
+        let song_time = songs::table
+            .inner_join(albums::table)
+            .filter(albums::music_folder_id.eq(self.music_folder.id))
+            .filter(songs::relative_path.eq(relative_path))
+            .select(songs::IdTime::as_select())
+            .get_result(&mut self.database.get().await?)
+            .await
+            .optional()?;
+
+        if let Some(song_time) = song_time
+            && song_time.time.scanned_at < started_at
+        {
+            diesel::update(songs::table)
+                .filter(songs::id.eq(song_time.id))
+                .set(songs::scanned_at.eq(crate::time::now().await))
+                .execute(&mut self.database.get().await?)
+                .await?;
+        }
+
+        Ok(song_time)
+    }
+
+    #[cfg_attr(not(coverage_nightly), instrument(skip_all, ret(level = "trace")))]
     async fn query_hash_size(
         &self,
         property: &file::Property<audio::Format>,
@@ -207,6 +238,221 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         Ok(())
     }
 
+    async fn upsert_cue_flac(
+        &self,
+        started_at: time::OffsetDateTime,
+        dir_image_id: Option<Uuid>,
+        flac_relative_path: Utf8TypedPath<'_>,
+        _cue_path: Utf8TypedPath<'_>,
+        cue_hash: u64,
+        cue_sheet: &cue::CueSheet,
+        base_information: &audio::Information<'_>,
+    ) -> Result<Uuid, Error> {
+        let database = &self.database;
+
+        let Some(audio_file_name) = flac_relative_path.file_name() else {
+            return error::Kind::MissingPathExtension(flac_relative_path.to_path_buf()).into();
+        };
+
+        if !cue_sheet.is_single_file() || !cue_sheet.file_name_matches(audio_file_name) {
+            return error::Kind::NotFound.into();
+        }
+
+        let cue_relative_path = flac_relative_path.to_path_buf().with_extension("cue");
+
+        let base_album = &base_information.metadata.album;
+        let album_name =
+            cue_sheet.title.as_deref().unwrap_or_else(|| base_album.name.as_ref()).to_owned();
+        let album_date = cue_sheet
+            .date
+            .as_deref()
+            .and_then(|s| s.parse::<audio::Date>().ok())
+            .unwrap_or(base_album.date);
+
+        let album_artist_fallback = base_information
+            .metadata
+            .artists
+            .album()
+            .first()
+            .map(|a| a.name.as_ref())
+            .unwrap_or("Unknown Artist");
+        let album_artist_name =
+            cue_sheet.performer.as_deref().unwrap_or(album_artist_fallback).to_owned();
+
+        // Upsert album once; track songs will reference it.
+        let album_id = audio::Album {
+            name: Cow::Owned(album_name),
+            date: album_date,
+            release_date: base_album.release_date,
+            original_release_date: base_album.original_release_date,
+            mbz_id: base_album.mbz_id,
+        }
+        .upsert(
+            database,
+            albums::Foreign { music_folder_id: self.music_folder.id, cover_art_id: dir_image_id },
+        )
+        .await?;
+
+        // Extract embedded cover art once, then reuse its id for every virtual track song.
+        let embedded_cover_art_id =
+            base_information.upsert_cover_art(database, self.config.cover_art.dir.as_ref()).await?;
+
+        let base_languages = base_information.metadata.song.languages.clone();
+        let base_disc = base_information.metadata.song.track_disc.disc;
+        let base_genres: Vec<String> = base_information
+            .metadata
+            .genres
+            .value
+            .iter()
+            .map(|g| g.value.clone().into_owned())
+            .collect();
+
+        let total_duration_s = f32::from(base_information.property.duration) as f64;
+        let base_file_hash = base_information.file.hash;
+        let base_file_size = base_information.file.size.get();
+        let base_property = base_information.property;
+
+        let cue_file = cue_sheet.files.get(0).ok_or_else(|| error::Kind::NotFound)?;
+        let track_total: Option<u16> = cue_file.tracks.len().try_into().ok();
+
+        let mut first_song_id: Option<Uuid> = None;
+
+        for (i, track) in cue_file.tracks.iter().enumerate() {
+            let Some(start_seconds) = track.index01.map(cue::CueTime::as_seconds_f64) else {
+                continue;
+            };
+            if start_seconds >= total_duration_s {
+                continue;
+            }
+
+            let next_start_seconds = cue_file
+                .tracks
+                .iter()
+                .skip(i + 1)
+                .find_map(|t| t.index01.map(cue::CueTime::as_seconds_f64));
+            let duration_seconds = next_start_seconds.unwrap_or(total_duration_s) - start_seconds;
+            let duration_seconds = duration_seconds.max(0.0);
+
+            if duration_seconds == 0.0 {
+                continue;
+            }
+
+            let track_relative_path = cue::build_virtual_track_relative_path(
+                cue_relative_path.to_path(),
+                track.number,
+                audio::Format::Flac,
+            )?;
+            let track_relative_path = track_relative_path.to_string();
+
+            // Keep each virtual track unique within a music folder to avoid `file_hash+file_size`
+            // conflicts (and to keep cache keys stable).
+            let hash = {
+                // Include both the audio file hash and cue hash so cache keys are invalidated when
+                // either file changes.
+                let mut buf = Vec::with_capacity(16 + track_relative_path.len());
+                buf.extend_from_slice(&base_file_hash.to_le_bytes());
+                buf.extend_from_slice(&cue_hash.to_le_bytes());
+                buf.extend_from_slice(track_relative_path.as_bytes());
+                xxh3_64(&buf)
+            };
+
+            let estimated_size = if total_duration_s > 0.0 {
+                let ratio = (duration_seconds / total_duration_s).clamp(0.0, 1.0);
+                ((base_file_size as f64) * ratio).round().clamp(1.0, f64::from(u32::MAX)) as u32
+            } else {
+                base_file_size
+            };
+
+            let title = track
+                .title
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Track {:02}", track.number));
+            let song_artist_name = track.artist.as_deref().unwrap_or(&album_artist_name).to_owned();
+
+            let artists = audio::Artists::new(
+                [audio::Artist { name: Cow::Owned(song_artist_name), mbz_id: None }],
+                [audio::Artist { name: Cow::Owned(album_artist_name.clone()), mbz_id: None }],
+                false,
+            )?;
+
+            let information = audio::Information {
+                metadata: audio::Metadata {
+                    song: audio::Song {
+                        main: audio::NameDateMbz {
+                            name: Cow::Owned(title),
+                            date: audio::Date::default(),
+                            release_date: audio::Date::default(),
+                            original_release_date: audio::Date::default(),
+                            mbz_id: None,
+                        },
+                        track_disc: audio::TrackDisc {
+                            track: audio::position::Position {
+                                number: Some(track.number),
+                                total: track_total,
+                            },
+                            disc: base_disc,
+                        },
+                        languages: base_languages.clone(),
+                    },
+                    // Album is already upserted; keep the fields consistent anyway.
+                    album: audio::Album {
+                        name: Cow::Borrowed(""),
+                        date: audio::Date::default(),
+                        release_date: audio::Date::default(),
+                        original_release_date: audio::Date::default(),
+                        mbz_id: None,
+                    },
+                    artists,
+                    genres: base_genres.iter().cloned().collect(),
+                    lyrics: vec![],
+                    image: None,
+                },
+                property: audio::Property {
+                    duration: time::Duration::seconds_f64(duration_seconds).into(),
+                    ..base_property
+                },
+                file: file::Property {
+                    hash,
+                    size: NonZeroU32::new(estimated_size)
+                        .ok_or_else(|| error::Kind::EmptyFileEncountered)?,
+                    format: audio::Format::Flac,
+                },
+            };
+
+            let song_time =
+                self.set_scanned_at_relative_path(&track_relative_path, started_at).await?;
+            let old_song_id = song_time.map(|t| t.id);
+
+            let song_id = information
+                .upsert_song(
+                    database,
+                    songs::Foreign { album_id, cover_art_id: embedded_cover_art_id },
+                    track_relative_path,
+                    old_song_id,
+                )
+                .await?;
+            information
+                .upsert_artists(database, &self.config.index.ignore_prefixes, song_id)
+                .await?;
+            information.upsert_genres(database, song_id).await?;
+            information.upsert_lyrics(database, song_id).await?;
+            audio::Information::cleanup_one(database, started_at, song_id).await?;
+
+            first_song_id.get_or_insert(song_id);
+        }
+
+        let Some(first_song_id) = first_song_id else { return error::Kind::NotFound.into() };
+
+        // Keep the album folder cover art in sync.
+        self.update_dir_image(first_song_id, dir_image_id).await?;
+
+        // NOTE: external lyric scanning is intentionally skipped for CUE-derived virtual tracks.
+        // If needed later, we can map `.lrc` discovery to CUE `TRACK` titles or virtual filenames.
+
+        Ok(first_song_id)
+    }
+
     #[cfg_attr(
         not(coverage_nightly),
         instrument(
@@ -219,30 +465,74 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
     async fn one(&self, entry: &Entry, started_at: time::OffsetDateTime) -> Result<Uuid, Error> {
         let database = &self.database;
 
+        let cue = if entry.format == audio::Format::Flac {
+            let cue_path = entry.path.clone().with_extension("cue");
+            if self.filesystem.exists(cue_path.to_path()).await? {
+                match self.filesystem.read(cue_path.to_path()).await {
+                    Ok(bytes) => {
+                        let cue_hash = xxh3_64(&bytes);
+                        match cue::CueSheet::parse(&bytes) {
+                            Ok(sheet) => {
+                                let audio_file_name = entry.path.file_name().unwrap_or_default();
+                                let has_track_index = sheet
+                                    .files
+                                    .get(0)
+                                    .is_some_and(|f| f.tracks.iter().any(|t| t.index01.is_some()));
+                                if has_track_index
+                                    && sheet.is_single_file()
+                                    && sheet.file_name_matches(audio_file_name)
+                                {
+                                    Some((cue_path, cue_hash, sheet))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(?error, path = %cue_path, "invalid cue file");
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(?error, path = %cue_path, "failed to read cue file");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Query the database to see if we have any song within this music folder that has the same
         // relative path. If yes, update its scanned at to the current time.
         //
         // Doing this helps us avoiding working on the same file at the same time (which is mostly
         // the case for multiple scans).
-        let song_id = if let Some(song_time) = self.set_scanned_at(entry, started_at).await? {
-            if started_at < song_time.time.scanned_at
-                || (!self.full.file
-                    && entry
-                        .last_modified
-                        .is_some_and(|last_modified| last_modified < song_time.time.updated_at))
-            {
-                // If `started_at` is sooner than its database's `scanned_at` or its filesystem's
-                // last modified is sooner than its database's `updated_at`, it means that we have
-                // the latest data or this file is being scanned by another process, we can return
-                // the function.
-                //
-                // Since the old `scanned_at` is returned, there is a case when the file is scanned
-                // in the previous scan but not in the current scan, thus `scanned_at` is sooner
-                // than `started_at`. We want to skip this file as well (unless in full mode) hence
-                // we have to check for its `last_modified` along with `scanned_at`.
-                return Ok(song_time.id);
+        let song_id = if cue.is_none() {
+            if let Some(song_time) = self.set_scanned_at(entry, started_at).await? {
+                if started_at < song_time.time.scanned_at
+                    || (!self.full.file
+                        && entry
+                            .last_modified
+                            .is_some_and(|last_modified| last_modified < song_time.time.updated_at))
+                {
+                    // If `started_at` is sooner than its database's `scanned_at` or its filesystem's
+                    // last modified is sooner than its database's `updated_at`, it means that we have
+                    // the latest data or this file is being scanned by another process, we can return
+                    // the function.
+                    //
+                    // Since the old `scanned_at` is returned, there is a case when the file is scanned
+                    // in the previous scan but not in the current scan, thus `scanned_at` is sooner
+                    // than `started_at`. We want to skip this file as well (unless in full mode) hence
+                    // we have to check for its `last_modified` along with `scanned_at`.
+                    return Ok(song_time.id);
+                }
+                Some(song_time.id)
+            } else {
+                None
             }
-            Some(song_time.id)
         } else {
             None
         };
@@ -263,8 +553,10 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         tracing::trace!(?dir_image_id);
 
         let relative_path = self.relative_path(entry)?;
-        let relative_path = relative_path.as_str();
-        let song_id = if let Some(song_path) = self.query_hash_size(&file.property).await? {
+        let relative_path_str = relative_path.as_str();
+        let song_id = if cue.is_none()
+            && let Some(song_path) = self.query_hash_size(&file.property).await?
+        {
             if started_at < song_path.time.updated_at {
                 // We will check if `song_path.updated_at` is later than `started_at`, since this
                 // file has the same hash and size with that entry in the database, we can terminate
@@ -293,7 +585,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                 //
                 // We prevent this error by checking the `song_path.updated_at` as above so we can
                 // skip checking `song_path.relative_path` after being updated.
-                if song_id == song_path.id && relative_path == song_path.relative_path {
+                if song_id == song_path.id && relative_path_str == song_path.relative_path {
                     if self.full.file {
                         // If file full scan is enabled, we return the song id so it can be
                         // re-scanned later.
@@ -329,7 +621,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                 diesel::update(songs::table)
                     .filter(songs::id.eq(song_path.id))
                     .set((
-                        songs::relative_path.eq(relative_path),
+                        songs::relative_path.eq(relative_path_str),
                         songs::scanned_at.eq(crate::time::now().await),
                     ))
                     .execute(&mut database.get().await?)
@@ -337,7 +629,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
 
                 self.update_external(started_at, song_path.id, absolute_path, dir_image_id).await?;
                 tracing::warn!(
-                    old = %song_path.relative_path, new = %relative_path, "renamed duplication"
+                    old = %song_path.relative_path, new = %relative_path_str, "renamed duplication"
                 );
                 return Ok(song_path.id);
             }
@@ -349,6 +641,20 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
         let information = audio.extract(&self.config.parsing)?;
         tracing::trace!(?information);
 
+        if let Some((cue_path, cue_hash, cue_sheet)) = cue {
+            return self
+                .upsert_cue_flac(
+                    started_at,
+                    dir_image_id,
+                    relative_path,
+                    cue_path.to_path(),
+                    cue_hash,
+                    &cue_sheet,
+                    &information,
+                )
+                .await;
+        }
+
         let song_id = information
             .upsert(
                 database,
@@ -357,7 +663,7 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
                     music_folder_id: self.music_folder.id,
                     cover_art_id: dir_image_id,
                 },
-                relative_path,
+                relative_path_str,
                 song_id,
             )
             .await?;
@@ -424,11 +730,15 @@ impl<'db, 'fs, 'mf> Scanner<'db, 'fs, 'mf> {
 #[cfg(test)]
 #[coverage(off)]
 mod tests {
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::RunQueryDsl;
     use fake::{Fake, Faker};
+    use nghe_api::common::filesystem as api_filesystem;
     use nghe_api::scan;
     use rstest::rstest;
 
     use crate::file::audio;
+    use crate::orm::{albums, songs};
     use crate::test::{Mock, mock};
 
     #[rstest]
@@ -493,6 +803,73 @@ mod tests {
 
         let database_audio = music_folder.query_filesystem().await;
         assert_eq!(database_audio, music_folder.filesystem);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_scan_cue_flac_virtual_tracks(
+        #[future(awt)]
+        #[with(1, 0)]
+        mock: Mock,
+        #[values(api_filesystem::Type::Local, api_filesystem::Type::S3)] ty: api_filesystem::Type,
+    ) {
+        use crate::cue;
+        use crate::test::filesystem::Trait as _;
+
+        mock.add_music_folder().ty(ty).call().await;
+        let mut music_folder = mock.music_folder(0).await;
+        music_folder
+            .add_audio_filesystem::<&str>()
+            .path("a/Album.flac")
+            .format(audio::Format::Flac)
+            .scan(false)
+            .recompute_dir_image(false)
+            .call()
+            .await;
+
+        let cue_data = r#"
+PERFORMER "Cue Artist"
+TITLE "Cue Album"
+REM DATE 2001
+FILE "Album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Two"
+    INDEX 01 00:10:00
+"#;
+        let cue_path = music_folder.absolutize("a/Album.cue");
+        music_folder.to_impl().write(cue_path.to_path(), cue_data.as_bytes()).await;
+
+        music_folder.scan(scan::start::Full::default()).run().await.unwrap();
+
+        let cue_relative_path = music_folder.path_str(&"a/Album.cue");
+        let expected_1 =
+            cue::build_virtual_track_relative_path(cue_relative_path, 1, audio::Format::Flac)
+                .unwrap()
+                .to_string();
+        let expected_2 =
+            cue::build_virtual_track_relative_path(cue_relative_path, 2, audio::Format::Flac)
+                .unwrap()
+                .to_string();
+
+        let mut conn = mock.get().await;
+        let mut rows: Vec<(String, String)> = albums::table
+            .inner_join(songs::table)
+            .filter(albums::music_folder_id.eq(music_folder.id()))
+            .select((songs::relative_path, songs::title))
+            .order_by(songs::relative_path.asc())
+            .get_results(&mut conn)
+            .await
+            .unwrap();
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(rows, vec![(expected_1, "One".to_owned()), (expected_2, "Two".to_owned()),]);
+        assert!(
+            rows.iter().all(|(path, _)| path != "a/Album.flac"),
+            "physical flac must not be inserted as a song when paired with a CUE"
+        );
     }
 
     mod filesystem {

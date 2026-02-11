@@ -285,14 +285,10 @@ mod test {
 
         let filesystem = music_folder.to_impl();
         let folder_name = "Folder.JPG";
-        let folder_path = music_folder.path().join(folder_name).to_path();
-        filesystem.write(folder_path, &fake::vec![u8; 128]).await;
+        let folder_path_buf = music_folder.path().join(folder_name);
+        filesystem.write(folder_path_buf.to_path(), &fake::vec![u8; 128]).await;
 
-        music_folder
-            .scan(nghe_api::scan::start::Full::default())
-            .run()
-            .await
-            .unwrap();
+        music_folder.scan(nghe_api::scan::start::Full::default()).run().await.unwrap();
 
         let song_id = music_folder.song_id_filesystem(0).await;
         let song = query::with_user_id_unchecked(mock.user_id(0).await)
@@ -310,9 +306,6 @@ mod test {
             .unwrap();
 
         let source = source.expect("expected cover art source to be stored");
-        assert_eq!(
-            source.to_lowercase(),
-            music_folder.path().join(folder_name).to_string().to_lowercase()
-        );
+        assert_eq!(source.to_lowercase(), folder_path_buf.to_string().to_lowercase());
     }
 }
