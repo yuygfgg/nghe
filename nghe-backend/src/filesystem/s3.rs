@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use educe::Educe;
 use s3::Client;
+use std::collections::HashSet;
 use time::OffsetDateTime;
 use typed_path::Utf8TypedPath;
 
@@ -96,6 +97,34 @@ impl super::Trait for Filesystem {
         }
 
         Ok(())
+    }
+
+    async fn list_dir(&self, dir: Utf8TypedPath<'_>) -> Result<Vec<String>, Error> {
+        let Path { bucket, key } = Self::split(dir)?;
+
+        // Treat `dir` as a prefix (directory). For S3, "directories" are just prefixes.
+        let mut prefix = key.to_owned();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+
+        let mut names: HashSet<String> = HashSet::new();
+        let mut pager = self.client.objects().list_v2(bucket).prefix(&prefix).pager();
+
+        while let Some(output) = pager.next_page().await? {
+            for content in output.contents {
+                // `content.key` is the full key, e.g. "a/b/Cover.JPG".
+                let k = content.key;
+                let Some(rest) = k.strip_prefix(&prefix) else { continue };
+                if rest.is_empty() {
+                    continue;
+                }
+                let child = rest.split('/').next().unwrap_or(rest);
+                names.insert(child.to_owned());
+            }
+        }
+
+        Ok(names.into_iter().collect())
     }
 
     async fn exists(&self, path: Utf8TypedPath<'_>) -> Result<bool, Error> {

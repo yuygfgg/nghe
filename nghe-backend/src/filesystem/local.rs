@@ -87,6 +87,19 @@ impl super::Trait for Filesystem {
         Ok(())
     }
 
+    async fn list_dir(&self, dir: Utf8TypedPath<'_>) -> Result<Vec<String>, Error> {
+        let mut rd = tokio::fs::read_dir(dir.as_str()).await?;
+        let mut names = Vec::new();
+        while let Some(entry) = rd.next_entry().await? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(error::Kind::NonUTF8PathEncountered)?;
+            names.push(name);
+        }
+        Ok(names)
+    }
+
     async fn exists(&self, path: Utf8TypedPath<'_>) -> Result<bool, Error> {
         tokio::fs::try_exists(path.as_str()).await.map_err(Error::from)
     }

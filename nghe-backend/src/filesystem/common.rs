@@ -38,6 +38,7 @@ pub trait Trait {
         sender: entry::Sender,
         prefix: Utf8TypedPath<'_>,
     ) -> Result<(), Error>;
+    async fn list_dir(&self, dir: Utf8TypedPath<'_>) -> Result<Vec<String>, Error>;
 
     async fn exists(&self, path: Utf8TypedPath<'_>) -> Result<bool, Error>;
 
@@ -68,6 +69,13 @@ impl Trait for Impl<'_> {
         match self {
             Impl::Local(filesystem) => filesystem.scan_folder(sender, prefix).await,
             Impl::S3(filesystem) => filesystem.scan_folder(sender, prefix).await,
+        }
+    }
+
+    async fn list_dir(&self, dir: Utf8TypedPath<'_>) -> Result<Vec<String>, Error> {
+        match self {
+            Impl::Local(filesystem) => filesystem.list_dir(dir).await,
+            Impl::S3(filesystem) => filesystem.list_dir(dir).await,
         }
     }
 

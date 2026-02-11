@@ -54,6 +54,13 @@ impl filesystem::Trait for Impl<'_> {
         }
     }
 
+    async fn list_dir(&self, dir: Utf8TypedPath<'_>) -> Result<Vec<String>, Error> {
+        match self {
+            Impl::Local(filesystem) => filesystem.list_dir(dir).await,
+            Impl::S3(filesystem) => filesystem.list_dir(dir).await,
+        }
+    }
+
     async fn exists(&self, path: Utf8TypedPath<'_>) -> Result<bool, Error> {
         match self {
             Impl::Local(filesystem) => filesystem.exists(path).await,

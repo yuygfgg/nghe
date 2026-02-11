@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::Error;
 use crate::database::Database;
 use crate::orm::id3::artist;
-use crate::orm::{artists, songs_album_artists};
+use crate::orm::{artists, songs_album_artists, songs_artists};
 
 pub struct Artists;
 
@@ -14,12 +14,18 @@ impl Artists {
         database: &Database,
         album_id: Uuid,
     ) -> Result<Vec<id3::artist::Required>, Error> {
-        Ok(query::with_album_id_unchecked(album_id)
+        let mut out: Vec<artist::required::Required> = query::with_album_id_unchecked(album_id)
             .get_results(&mut database.get().await?)
-            .await?
-            .into_iter()
-            .map(artist::required::Required::into)
-            .collect())
+            .await?;
+
+        // Fall back to song artists if album artists are missing.
+        if out.is_empty() {
+            out = query::with_album_id_fallback_song_artists_unchecked(album_id)
+                .get_results(&mut database.get().await?)
+                .await?;
+        }
+
+        Ok(out.into_iter().map(artist::required::Required::into).collect())
     }
 }
 
@@ -47,6 +53,24 @@ mod query {
                 min(songs::disc_number).asc().nulls_first(),
                 min(songs::track_number).asc().nulls_first(),
                 min(songs_album_artists::upserted_at).asc(),
+            ))
+            .select(required)
+    }
+
+    #[auto_type]
+    pub fn with_album_id_fallback_song_artists_unchecked(album_id: Uuid) -> _ {
+        let required: AsSelect<artist::required::Required, crate::orm::Type> =
+            artist::required::Required::as_select();
+        songs::table
+            .inner_join(albums::table)
+            .inner_join(songs_artists::table)
+            .inner_join(artist::required::query::song())
+            .filter(albums::id.eq(album_id))
+            .group_by(artists::id)
+            .order_by((
+                min(songs::disc_number).asc().nulls_first(),
+                min(songs::track_number).asc().nulls_first(),
+                min(songs_artists::upserted_at).asc(),
             ))
             .select(required)
     }

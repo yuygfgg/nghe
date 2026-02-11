@@ -18,7 +18,9 @@ use crate::{Error, error};
 pub struct Full {
     #[diesel(embed)]
     pub album: Album,
-    #[diesel(select_expression = sql("bool_or(songs_album_artists.compilation) is_compilation"))]
+    #[diesel(select_expression = sql(
+        "coalesce(bool_or(songs_album_artists.compilation), false) is_compilation"
+    ))]
     #[diesel(select_expression_type = SqlLiteral::<sql_types::Bool>)]
     pub is_compilation: bool,
     #[diesel(select_expression = sql("array_agg(distinct(songs.id)) song_ids"))]
@@ -76,7 +78,9 @@ pub mod query {
             album::query::with_user_id_unchecked_no_group_by(user_id);
         let full: AsSelect<Full, crate::orm::Type> = Full::as_select();
         with_user_id_unchecked_no_group_by
-            .inner_join(songs_album_artists::table.on(songs_album_artists::song_id.eq(songs::id)))
+            // Historical/partial scans can leave `songs_album_artists` empty for some songs.
+            // We should still be able to fetch the album detail in that case.
+            .left_join(songs_album_artists::table.on(songs_album_artists::song_id.eq(songs::id)))
             .group_by(albums::id)
             .select(full)
     }

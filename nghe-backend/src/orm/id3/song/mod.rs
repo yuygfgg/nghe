@@ -180,7 +180,9 @@ mod test {
 
     use super::*;
     use crate::file::image;
+    use crate::orm::cover_arts;
     use crate::orm::songs;
+    use crate::test::filesystem::Trait as _;
     use crate::test::{Mock, mock};
 
     #[rstest]
@@ -261,5 +263,56 @@ mod test {
                 assert!(song.cover_art.is_none());
             }
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_query_cover_art_folder_filename_case_insensitive(#[future(awt)] mock: Mock) {
+        let mut music_folder = mock.music_folder(0).await;
+
+        // Create an audio file (no embedded image), then add a directory cover named like
+        // "folder.jpg/png/..." with arbitrary casing.
+        music_folder
+            .add_audio_filesystem::<&str>()
+            .album(Faker.fake())
+            .image(None)
+            .depth(0)
+            .n_song(1)
+            .scan(false)
+            .recompute_dir_image(false)
+            .call()
+            .await;
+
+        let filesystem = music_folder.to_impl();
+        let folder_name = "Folder.JPG";
+        let folder_path = music_folder.path().join(folder_name).to_path();
+        filesystem.write(folder_path, &fake::vec![u8; 128]).await;
+
+        music_folder
+            .scan(nghe_api::scan::start::Full::default())
+            .run()
+            .await
+            .unwrap();
+
+        let song_id = music_folder.song_id_filesystem(0).await;
+        let song = query::with_user_id_unchecked(mock.user_id(0).await)
+            .filter(songs::id.eq(song_id))
+            .get_result(&mut mock.get().await)
+            .await
+            .unwrap();
+
+        let cover_art_id = song.cover_art.expect("expected directory cover art fallback");
+        let source: Option<String> = cover_arts::table
+            .filter(cover_arts::id.eq(cover_art_id))
+            .select(cover_arts::source)
+            .get_result(&mut mock.get().await)
+            .await
+            .unwrap();
+
+        let source = source.expect("expected cover art source to be stored");
+        assert_eq!(
+            source.to_lowercase(),
+            music_folder.path().join(folder_name).to_string().to_lowercase()
+        );
     }
 }

@@ -1,6 +1,7 @@
 mod resize;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use diesel::sql_types::Text;
 use diesel::{
@@ -170,13 +171,34 @@ impl<'d> Image<'d> {
         dir: Utf8TypedPath<'_>,
     ) -> Result<Option<Uuid>, Error> {
         if let Some(ref art_dir) = config.dir {
+            // Pass 1: exact filename match (works on case-insensitive FS too).
             for name in &config.names {
-                let path = dir.join(name);
-                let path = path.to_path();
-                if !full && let Some(image_id) = Self::query_source(database, path).await? {
+                let path_buf = dir.join(name);
+                let path = path_buf.to_path();
+                if !full && let Some(image_id) = Self::query_source(database, path.as_str()).await? {
                     return Ok(Some(image_id));
-                } else if let Some(image) = Image::load(filesystem, path).await? {
-                    return Ok(Some(image.upsert(database, art_dir, Some(path)).await?));
+                }
+                if let Some(image) = Image::load(filesystem, path).await? {
+                    return Ok(Some(image.upsert(database, art_dir, Some(path.as_str())).await?));
+                }
+            }
+
+            // Pass 2: case-insensitive resolution by listing the directory.
+            let mut entries_lower: HashMap<String, String> = HashMap::new();
+            for entry in filesystem.list_dir(dir).await? {
+                // First one wins; config.names defines priority.
+                entries_lower.entry(entry.to_lowercase()).or_insert(entry);
+            }
+
+            for name in &config.names {
+                let Some(actual_name) = entries_lower.get(&name.to_lowercase()) else { continue };
+                let path_buf = dir.join(actual_name);
+                let path = path_buf.to_path();
+                if !full && let Some(image_id) = Self::query_source(database, path.as_str()).await? {
+                    return Ok(Some(image_id));
+                }
+                if let Some(image) = Image::load(filesystem, path).await? {
+                    return Ok(Some(image.upsert(database, art_dir, Some(path.as_str())).await?));
                 }
             }
         }
