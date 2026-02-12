@@ -22,7 +22,6 @@ env:
   RUST_BACKTRACE: full
   RUST_LOG: nghe_backend=trace
   COLORBT_SHOW_HIDDEN: 1
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   DATABASE_URL: "postgres://postgres:postgres@localhost:5432/postgres"
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: minioadmin
@@ -79,12 +78,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Install yq
+        uses: ./.github/actions/install-yq
+
       - name: Extract build information
         id: build
         env:
@@ -95,17 +91,12 @@ jobs:
           echo "docker-arch=${{ startsWith(matrix.platform.target, 'x86_64') && 'amd64' || 'arm64' }}" >> "$GITHUB_OUTPUT"
           echo "profile=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'dev' }}" >> "$GITHUB_OUTPUT"
           echo "output-dir=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'debug' }}" >> "$GITHUB_OUTPUT"
-      - name: Extract rust toolchain
-        id: toolchain
-        run: |
-          echo "channel=$(grep channel rust-toolchain.toml | awk -F' = ' '{printf $2}' | tr -d '\"')" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+
+      - name: Setup rust
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.platform.target }}-${{ steps.build.outputs.profile }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-key: ${{ matrix.platform.target }}-${{ steps.build.outputs.profile }}
+
       - name: Increase postgres max connection
         run: |
           docker exec postgres psql -U postgres -d postgres -c "ALTER SYSTEM SET max_connections = '1000'";
@@ -114,7 +105,7 @@ jobs:
 
       - name: Setup musl environment
         run: |
-          wget -c https://github.com/xmake-mirror/musl.cc/releases/download/20210202/${{ steps.build.outputs.arch }}-linux-musl-cross.linux.tgz -O - | tar -xz
+          wget -c https://github.com/musl-cc/musl.cc/releases/download/v0.0.1/${{ steps.build.outputs.arch }}-linux-musl-cross.tgz -O - | tar -xz
           sudo ln -s ${{ github.workspace }}/${{ steps.build.outputs.arch }}-linux-musl-cross/bin/${{ steps.build.outputs.arch }}-linux-musl-g++ /usr/bin/${{ steps.build.outputs.arch }}-linux-musl-g++
           sudo ln -s ${{ github.workspace }}/${{ steps.build.outputs.arch }}-linux-musl-cross/bin/${{ steps.build.outputs.arch }}-linux-musl-gcc /usr/bin/${{ steps.build.outputs.arch }}-linux-musl-gcc
           ${{ steps.build.outputs.arch }}-linux-musl-gcc --version
@@ -123,15 +114,10 @@ jobs:
           ${{ steps.build.outputs.arch }}-linux-musl-pkg-config --version
         if: ${{ steps.build.outputs.env == 'musl' }}
 
-      - name: Install vcpkg build deps
-        run: sudo apt-get --assume-yes install nasm
-      - name: Install cargo-vcpkg
-        uses: taiki-e/cache-cargo-install-action@v3
+      - name: Build vcpkg deps
+        uses: ./.github/actions/build-vcpkg-deps
         with:
-          tool: cargo-vcpkg
-      - name: Build vcpkg dependencies
-        run: |
-          cargo vcpkg --verbose build --manifest-path nghe-backend/Cargo.toml --target ${{ matrix.platform.target }}
+          rust-target: ${{ matrix.platform.target }}
 
       - name: Install cross
         if: ${{ matrix.platform.command == 'cross' }}
@@ -139,7 +125,7 @@ jobs:
         with:
           tool: cross
           git: https://github.com/cross-rs/cross
-          rev: c7dee4d008475ce1c140773cbcd6078f4b86c2aa
+          rev: 19bc73f2775a0683a991910a21c6368aaaa858f8
           locked: false
 
       - name: Install cargo-nextest
@@ -205,7 +191,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            name=ghcr.io/${{ github.repository }}-gnu
+            name=ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -216,7 +202,7 @@ jobs:
           context: .
           file: ci/docker/Dockerfile
           build-args: |
-            BASE_IMAGE=debian:12.8-slim
+            BASE_IMAGE=debian:13-slim
             TARGET_ENV=gnu
           platforms: linux/amd64,linux/arm64
           push: true
@@ -228,7 +214,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            name=ghcr.io/${{ github.repository }}-musl
+            name=ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-scratch,onlatest=true
           tags: |
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -239,7 +227,7 @@ jobs:
           context: .
           file: ci/docker/Dockerfile
           build-args: |
-            BASE_IMAGE=alpine:3.21.0
+            BASE_IMAGE=scratch
             TARGET_ENV=musl
           platforms: linux/amd64,linux/arm64
           push: true
@@ -250,29 +238,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Install yq
+        uses: ./.github/actions/install-yq
+
       - name: Extract build information
         id: build
         run: |
           echo "profile=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'dev' }}" >> $env:GITHUB_OUTPUT
           echo "output-dir=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'debug' }}" >> $env:GITHUB_OUTPUT
-      - name: Extract rust toolchain
-        id: toolchain
-        shell: bash
-        run: |
-          echo "channel=$(grep channel rust-toolchain.toml | awk -F' = ' '{printf $2}' | tr -d '\"')" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+
+      - name: Setup rust
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-pc-windows-msvc-${{ steps.build.outputs.profile }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-key: x86_64-pc-windows-msvc-${{ steps.build.outputs.profile }}
 
       - name: Install and setup postgres
         run: |
@@ -293,13 +271,10 @@ jobs:
         run: |
           curl https://dl.min.io/server/minio/release/windows-amd64/minio.exe --output minio.exe
 
-      - name: Install cargo-vcpkg
-        uses: taiki-e/cache-cargo-install-action@v3
+      - name: Build vcpkg deps
+        uses: ./.github/actions/build-vcpkg-deps
         with:
-          tool: cargo-vcpkg
-      - name: Build vcpkg dependencies
-        run: |
-          cargo vcpkg --verbose build --manifest-path nghe-backend\Cargo.toml --target x86_64-pc-windows-msvc
+          rust-target: x86_64-pc-windows-msvc
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -345,12 +320,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Install yq
+        uses: ./.github/actions/install-yq
+
       - name: Extract build information
         id: build
         env:
@@ -360,17 +332,11 @@ jobs:
           echo "docker-arch=${{ startsWith(matrix.platform.target, 'x86_64') && 'amd64' || 'arm64' }}" >> "$GITHUB_OUTPUT"
           echo "profile=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'dev' }}" >> "$GITHUB_OUTPUT"
           echo "output-dir=${{ (github.event_name == 'release' || github.event_name == 'workflow_dispatch') && 'release' || 'debug' }}" >> "$GITHUB_OUTPUT"
-      - name: Extract rust toolchain
-        id: toolchain
-        run: |
-          echo "channel=$(grep channel rust-toolchain.toml | awk -F' = ' '{printf $2}' | tr -d '\"')" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+
+      - name: Setup rust
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.platform.target }}-${{ steps.build.outputs.profile }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-key: ${{ matrix.platform.target }}-${{ steps.build.outputs.profile }}
 
       - name: Install and setup postgres
         run: |
@@ -387,15 +353,10 @@ jobs:
           brew install minio
           minio server --address=':9090' data &
 
-      - name: Install vcpkg build deps
-        run: brew install nasm
-      - name: Install cargo-vcpkg
-        uses: taiki-e/cache-cargo-install-action@v3
+      - name: Build vcpkg deps
+        uses: ./.github/actions/build-vcpkg-deps
         with:
-          tool: cargo-vcpkg
-      - name: Build vcpkg dependencies
-        run: |
-          cargo vcpkg --verbose build --manifest-path nghe-backend/Cargo.toml --target ${{ matrix.platform.target }}
+          rust-target: ${{ matrix.platform.target }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
