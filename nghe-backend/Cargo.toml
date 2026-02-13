@@ -103,6 +103,7 @@ cue-rw = { version = "0.2.1" }
 libflac-sys = { version = "0.3.1" }
 num_enum = { version = "0.7.3" }
 num-rational = { version = "0.4.2" }
+opencc-jieba-rs = { version = "0.7.2" }
 
 [dev-dependencies]
 bon = { workspace = true }

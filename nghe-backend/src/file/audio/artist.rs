@@ -9,7 +9,6 @@ use fake::{Dummy, Fake, Faker};
 use futures_lite::{StreamExt, stream};
 use indexmap::IndexSet;
 use itertools::Itertools;
-use o2o::o2o;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -18,12 +17,9 @@ use crate::orm::upsert::Insert as _;
 use crate::orm::{artists, songs_album_artists, songs_artists};
 use crate::{Error, error};
 
-#[derive(Debug, PartialEq, Eq, Hash, o2o)]
-#[from_owned(artists::Data<'a>)]
-#[ref_into(artists::Data<'a>)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Dummy, Clone, PartialOrd, Ord))]
 pub struct Artist<'a> {
-    #[ref_into(~.as_str().into())]
     #[cfg_attr(test, dummy(expr = "Faker.fake::<String>().into()"))]
     pub name: Cow<'a, str>,
     pub mbz_id: Option<Uuid>,
@@ -118,9 +114,17 @@ impl<'a> Artist<'a> {
         database: &Database,
         prefixes: &[impl AsRef<str>],
     ) -> Result<Uuid, Error> {
-        artists::Upsert { index: self.index(prefixes)?.to_string().into(), data: self.into() }
-            .insert(database)
-            .await
+        let normalized_name = crate::normalize::normalize_name(self.name.as_ref(), false);
+        artists::Upsert {
+            index: self.index(prefixes)?.to_string().into(),
+            data: artists::Data {
+                name: Cow::Borrowed(self.name.as_ref()),
+                normalized_name: Cow::Owned(normalized_name),
+                mbz_id: self.mbz_id,
+            },
+        }
+        .insert(database)
+        .await
     }
 
     async fn upserts<S: Borrow<Self> + 'a>(
@@ -132,6 +136,13 @@ impl<'a> Artist<'a> {
             .then(async |artist| artist.borrow().upsert(database, prefixes).await)
             .try_collect()
             .await
+    }
+}
+
+impl<'a> From<artists::Data<'a>> for Artist<'a> {
+    fn from(value: artists::Data<'a>) -> Self {
+        let artists::Data { name, mbz_id, .. } = value;
+        Self { name, mbz_id }
     }
 }
 

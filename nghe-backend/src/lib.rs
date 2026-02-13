@@ -26,6 +26,7 @@ mod http;
 mod integration;
 mod libflac_wrapper;
 pub mod migration;
+mod normalize;
 mod orm;
 mod route;
 mod scan;

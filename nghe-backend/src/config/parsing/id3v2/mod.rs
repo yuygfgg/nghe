@@ -5,6 +5,42 @@ use lofty::id3;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DelimitersInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn default_id3v23_delimiters() -> Vec<String> {
+    // Common separators seen in ID3v2.3 tags "in the wild".
+    vec![
+        "/".into(),
+        "／".into(),
+        "&".into(),
+        "＆".into(),
+        " x ".into(),
+        ";".into(),
+        "；".into(),
+        ",".into(),
+        "，".into(),
+        "×".into(),
+        "　".into(),
+        "、".into(),
+    ]
+}
+
+fn deserialize_delimiters<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = DelimitersInput::deserialize(deserializer)?;
+    Ok(match input {
+        DelimitersInput::One(s) => vec![s],
+        DelimitersInput::Many(v) => v,
+    })
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Common {
@@ -54,8 +90,9 @@ pub struct Id3v2 {
     pub genres: frame::Id,
     #[educe(Default(expression = "TXXX:compilation".parse().unwrap()))]
     pub compilation: frame::Id,
-    #[educe(Default(expression = '/'))]
-    pub separator: char,
+    #[educe(Default(expression = default_id3v23_delimiters()))]
+    #[serde(deserialize_with = "deserialize_delimiters")]
+    pub separator: Vec<String>,
 }
 
 impl Common {

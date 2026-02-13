@@ -22,14 +22,25 @@ fn get_text<'a>(tag: &'a Id3v2Tag, frame_id: &'a frame::Id) -> Result<Option<&'a
 fn get_texts<'a>(
     tag: &'a Id3v2Tag,
     frame_id: &'a frame::Id,
-    separator: char,
-) -> Result<Option<impl Iterator<Item = &'a str>>, Error> {
+    delimiters: &[String],
+) -> Result<Option<Vec<&'a str>>, Error> {
+    fn split_id3v23<'a>(text: &'a str, delimiters: &[String]) -> Vec<&'a str> {
+        // ID3v2.3 (and earlier) doesn't have a canonical multi-value separator, and tags
+        // in the wild use many different conventions. Split iteratively by all delimiters.
+        let mut parts = vec![text];
+        for delimiter in delimiters {
+            if delimiter.is_empty() {
+                continue;
+            }
+            parts = parts.into_iter().flat_map(|part| part.split(delimiter.as_str())).collect();
+        }
+        parts
+    }
+
     get_text(tag, frame_id).map(|text| {
-        text.map(|text| {
-            text.split(match tag.original_version() {
-                Id3v2Version::V4 => frame::Id::ID3V24_SEPARATOR,
-                _ => separator,
-            })
+        text.map(|text| match tag.original_version() {
+            Id3v2Version::V4 => text.split(frame::Id::ID3V24_SEPARATOR).collect(),
+            _ => split_id3v23(text, delimiters),
         })
     })
 }
@@ -82,15 +93,17 @@ impl<'a> Artist<'a> {
     fn extract_id3v2(
         tag: &'a Id3v2Tag,
         config: &'a config::parsing::id3v2::Artist,
-        separator: char,
+        delimiters: &[String],
     ) -> Result<IndexSet<Self>, Error> {
-        let names = get_texts(tag, &config.name, separator)?;
-        let mbz_ids = get_texts(tag, &config.mbz_id, separator)?;
+        let names = get_texts(tag, &config.name, delimiters)?;
+        let mbz_ids = get_texts(tag, &config.mbz_id, delimiters)?;
         match (names, mbz_ids) {
             (None, None) => Ok(IndexSet::default()),
             (None, Some(_)) => error::Kind::InvalidMbzIdSize.into(),
-            (Some(names), None) => Self::try_collect(names, vec![].into_iter()),
-            (Some(names), Some(mbz_ids)) => Self::try_collect(names, mbz_ids),
+            (Some(names), None) => Self::try_collect(names.into_iter(), vec![].into_iter()),
+            (Some(names), Some(mbz_ids)) => {
+                Self::try_collect(names.into_iter(), mbz_ids.into_iter())
+            }
         }
     }
 }
@@ -106,8 +119,8 @@ impl<'a> extract::Metadata<'a> for Id3v2Tag {
 
     fn artists(&'a self, config: &'a config::Parsing) -> Result<Artists<'a>, Error> {
         Artists::new(
-            Artist::extract_id3v2(self, &config.id3v2.artists.song, config.id3v2.separator)?,
-            Artist::extract_id3v2(self, &config.id3v2.artists.album, config.id3v2.separator)?,
+            Artist::extract_id3v2(self, &config.id3v2.artists.song, &config.id3v2.separator)?,
+            Artist::extract_id3v2(self, &config.id3v2.artists.album, &config.id3v2.separator)?,
             get_text(self, &config.id3v2.compilation)?.is_some_and(|s| !s.is_empty()),
         )
     }
@@ -124,9 +137,10 @@ impl<'a> extract::Metadata<'a> for Id3v2Tag {
     }
 
     fn languages(&'a self, config: &'a config::Parsing) -> Result<Vec<isolang::Language>, Error> {
-        Ok(get_texts(self, &config.id3v2.languages, config.id3v2.separator)?
+        Ok(get_texts(self, &config.id3v2.languages, &config.id3v2.separator)?
             .map(|languages| {
                 languages
+                    .into_iter()
                     .map(|language| Language::from_str(language).map_err(error::Kind::from))
                     .try_collect()
             })
@@ -135,8 +149,8 @@ impl<'a> extract::Metadata<'a> for Id3v2Tag {
     }
 
     fn genres(&'a self, config: &'a config::Parsing) -> Result<Genres<'a>, Error> {
-        Ok(get_texts(self, &config.id3v2.genres, config.id3v2.separator)?
-            .map(std::iter::Iterator::collect)
+        Ok(get_texts(self, &config.id3v2.genres, &config.id3v2.separator)?
+            .map(|genres| genres.into_iter().collect())
             .unwrap_or_default())
     }
 

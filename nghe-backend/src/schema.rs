@@ -47,6 +47,7 @@ diesel::table! {
     artists (id) {
         id -> Uuid,
         name -> Text,
+        normalized_name -> Text,
         index -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
