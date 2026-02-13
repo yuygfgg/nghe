@@ -18,22 +18,27 @@ An implementation of OpenSubsonic API in Rust
       - [Song](#song)
       - [Album](#album)
       - [Id3v2](#id3v2)
+      - [Artist normalization](#artist-normalization)
       - [Number and total](#number-and-total)
     - [Scan](#scan)
     - [Transcoding](#transcoding)
     - [Art](#art)
+    - [Lastfm](#lastfm)
+    - [Spotify](#spotify)
     - [S3](#s3)
   - [Scan process](#scan-process)
-    - [How a song is uniquely identified ?](#how-a-song-is-uniquely-identified--)
+    - [How a song is uniquely identified ?](#how-a-song-is-uniquely-identified-)
     - [Scan mode](#scan-mode)
       - [Quick](#quick)
       - [Full](#full)
       - [Force](#force)
-    - [How an artist is uniquely identified ?](#how-an-artist-is-uniquely-identified--)
-    - [How an album is uniquely identified ?](#how-an-album-is-uniquely-identified--)
+    - [How an artist is uniquely identified ?](#how-an-artist-is-uniquely-identified-)
+    - [How an album is uniquely identified ?](#how-an-album-is-uniquely-identified-)
   - [Permission model](#permission-model)
     - [Access to a song-level resource](#access-to-a-song-level-resource)
     - [Access to an artist or album level resource](#access-to-an-artist-or-album-level-resource)
+    - [Nested music folder](#nested-music-folder)
+    - [Configuration](#configuration-1)
   - [Compilation album](#compilation-album)
   - [Roadmap](#roadmap)
 
@@ -160,18 +165,48 @@ Id3v2 key is treated as two different ways depending on its length:
 - If you supply a 3 or 4 characters string, it will be treated as a frame id. For example TIT2.
 - Otherwise, it will be treated as an user text key in the frame TXXX. For example "MusicBrainz Release Track Id".
 
-In additional to those configurations above, id3v2 also has below configuration.
+In addition to those configurations above, id3v2 also has below configuration.
 
-|  Subkey   | Meaning                                  | Default value | Note                                                                                                             |
-| :-------: | :--------------------------------------- | :------------ | :--------------------------------------------------------------------------------------------------------------- |
-| separator | Separator for multiple values in id3v2.3 | '/'           | This is only applicable with id3v2.3, id3v2.4 will always be splited by '\0' (or '\\\\' if you are using mp3tag) |
+|  Subkey   | Meaning                                   | Default value | Note                                                                                                                         |
+| :-------: | :---------------------------------------- | :------------ | :--------------------------------------------------------------------------------------------------------------------------- |
+| separator | Delimiters for multiple values in id3v2.3 | see below     | This is only applicable with id3v2.3 (and earlier). id3v2.4 will always be split by '\0' (or '\\\\' if you are using mp3tag) |
+
+`separator` accepts either a single string or a list of strings. For id3v2.3 tags, values will be split iteratively by all delimiters.
+
+Default delimiters:
+
+```text
+/
+／
+&
+＆
+ x 
+;
+；
+,
+，
+×
+　
+、
+```
+
+#### Artist normalization
+
+When creating/updating database relationships, artists are grouped by `normalize_name(name)` (instead of requiring the raw tag strings to match) as long as MusicBrainz ID is not provided. This is stored as `artists.normalized_name` in the database.
+
+Normalization rules:
+
+- `trim()` then `lowercase()`
+- Traditional Chinese -> Simplified Chinese (OpenCC `t2s`)
+- Katakana -> Hiragana for basic Japanese syllabary characters
+- If used for search, all whitespace is removed (database grouping does not remove whitespace)
 
 #### Number and total
 
 You can set track/disc number and total by three ways below:
 
 - Setting fields `track_number`, `track_total`, etc normally. Unfortunately this does not work on id3v2.
-- Using only `track_number` and set it to `{track_number}/{track_total}`. This sets `track_number` and `track_total` to the corresponding numbers after spliting and works with all formats. The same thing holds for `disc_number`.
+- Using only `track_number` and set it to `{track_number}/{track_total}`. This sets `track_number` and `track_total` to the corresponding numbers after splitting and works with all formats. The same thing holds for `disc_number`.
 - Using only `track_number` and set it to `{character}{track_number}` like `A1`, `B10`. This sets the `disc_number` to the order of that character in the alphabet and `track_number` to the following number. `track_total` and `disc_total` will be none. This format is encountered while parsing vinyl records.
 
 ### Scan
